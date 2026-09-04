@@ -35,3 +35,13 @@ ignore = ["N818"]
 [tool.mypy]
 strict = true
 files = ["agent.py", "harness"]
+
+# The engine modules are compiled by numba, which takes its types from the signature in each
+# njit decorator and ignores the annotations entirely. Inside a jitted function a name is a
+# numpy scalar, at the call site it is a Python int, and mypy cannot model the boundary
+# between them. Correctness there is established by tests/check_perft.py against python-chess,
+# not by the type checker. agent.py, which is the actual contract with the platform, stays
+# strictly checked.
+[[tool.mypy.overrides]]
+module = ["bitboards", "position", "movegen", "evaluate", "searcher"]
+ignore_errors = true
