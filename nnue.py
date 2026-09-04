@@ -18,14 +18,12 @@ was built from, so a crossing costs the difference between two positions rather 
 from an empty board. Finn Eggers introduced it for Koivisto; Stockfish carries it as
 AccumulatorCaches.
 
-It is worth much less here than it is there, and the reason shapes the rest of this file. A
-cached refresh still moves HIDDEN values in and HIDDEN back out, which is a few AVX-512
-instructions for Stockfish and hundreds of scalar operations under numba. Anything proportional
-to HIDDEN costs this engine roughly thirty times what it costs a hand-vectorised one, and the
-refresh table only took a node from 936ns to 930ns.
+It is worth much less here than it is there: the refresh table took a node from 936ns only to
+930ns. Not because the updates are slow. numba vectorises them properly, and the inner loop of
+_apply compiles to vpaddw on ymm registers, sixteen int16 lanes at a time.
 
-What governs the cost here is cache residency. Every feature update reads one row of WEIGHTS, so
-the matrix wants to fit in L2:
+What governs the cost is cache residency. Every feature update reads one row of WEIGHTS, so the
+matrix wants to fit in L2:
 
     BUCKETS x 768 x HIDDEN x 2 bytes  <=  about 1 MB
 
@@ -34,6 +32,10 @@ HIDDEN 128 with four buckets it is 768KB, it fits, and the same parameter count 
 Hence this shape. It also means the bucket layout is free to be chosen for what the network can
 learn: a layout a castled king almost never leaves measured the same as one it crosses
 constantly, because crossings were never the expense.
+
+Every figure quoted here is nodes per second from a real search. Timing these functions by
+calling them from Python does not work: the dispatch alone costs about 230ns, which swamps a
+forward pass that actually takes 18ns, and makes everything look the same speed.
 
 BUCKETS = 1 disables bucketing and leaves a plain 768 network. That is not a fallback but a
 control: identical code path, so the two can be trained and measured against each other.

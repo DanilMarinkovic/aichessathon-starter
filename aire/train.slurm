@@ -11,14 +11,15 @@
 # Encoding is the slow part and it is single threaded, so --cache is used to do it once; later
 # runs over the same data start straight into training.
 #
-# You may need to add --partition and --account for your allocation. GPU nodes usually need an
-# explicit partition, so check `sinfo -s` if this sits in the queue.
+# Runs on CPU, on the default partition, deliberately. This network is small enough that CPU
+# training is a matter of minutes, the GPU partition is usually full, and its nodes have 24
+# cores against 168 here. If a GPU is ever wanted:
+#     sbatch --partition=gpu --gres=gpu:l40s:1 --cpus-per-task=8 aire/train.slurm
 
 #SBATCH --job-name=chess-train
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
 #SBATCH --output=aire/logs/train-%j.out
@@ -36,7 +37,7 @@ if [ ! -s "$DATA" ]; then
 fi
 
 echo "node $(hostname), $(nproc) cores"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "no gpu visible"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
 echo "$(wc -l < "$DATA") labelled positions"
 
 uv run python tools/train.py \

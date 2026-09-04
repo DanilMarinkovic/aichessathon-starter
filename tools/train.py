@@ -17,6 +17,7 @@ care about, and the blend keeps the network from inheriting the reference's conf
 """
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -175,8 +176,14 @@ def main() -> None:
     print(f"{len(target):,} positions, {nnue.BUCKETS} buckets, {nnue.HIDDEN} hidden")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"training on {device}")
-    torch.set_num_threads(1) if device == "cpu" else None
+    if device == "cpu":
+        # Use every core the job was given. The single-thread rule is a constraint on the
+        # platform the agent plays on, not on training, which happens here and offline.
+        cores = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+        torch.set_num_threads(cores)
+        print(f"training on cpu with {cores} threads")
+    else:
+        print(f"training on {torch.cuda.get_device_name(0)}")
 
     # Shift by one so index 0 can be the padding row EmbeddingBag ignores.
     white_tensor = torch.from_numpy(white.astype(np.int64) + 1).to(device)
