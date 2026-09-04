@@ -74,6 +74,10 @@ def _load() -> dict[str, object]:
             "qa": int(stored["qa"]),
             "qb": int(stored["qb"]),
             "scale": int(stored["scale"]),
+            # Absent in networks trained before calibration existed, and they must keep
+            # evaluating exactly as they did, so the fallback is the training scale.
+            "eval_scale": int(stored["eval_scale"]) if "eval_scale" in stored else
+            int(stored["scale"]),
             "weights": np.ascontiguousarray(stored["weights"].astype(np.int16)),
             "biases": np.ascontiguousarray(stored["biases"].astype(np.int16)),
             "output": np.ascontiguousarray(stored["output"].astype(np.int16)),
@@ -91,6 +95,7 @@ def _load() -> dict[str, object]:
         "qa": 255,
         "qb": 64,
         "scale": 400,
+        "eval_scale": 400,
         "weights": np.ascontiguousarray(
             rng.integers(-32, 32, size=(buckets * INPUTS, hidden)).astype(np.int16)
         ),
@@ -112,6 +117,23 @@ BUCKETS = int(_NET["buckets"])
 QA = int(_NET["qa"])
 QB = int(_NET["qb"])
 SCALE = int(_NET["scale"])
+
+# The units the evaluation reports in, which is not the same question as the scale it trained
+# through. Training fits sigmoid(cp / SCALE), and a network fitted against a blend of the
+# reference score and the game result comes out sharper than the reference: net-v1 tracks
+# Stockfish with a correlation of 0.96 and a slope of 2.28, so it ranks positions correctly
+# and reports them more than twice as large.
+#
+# That would be harmless -- alpha-beta only compares evaluations -- except that searcher.py is
+# full of margins in centipawns, all of them tuned when the evaluation was the hand-written one
+# on a classical pawn-is-100 scale. On a 2.28x evaluation the aspiration window of 30 behaves
+# like 13 and the futility margin of 80*depth behaves like 35*depth.
+#
+# So this divides the reported evaluation back onto the scale those constants were written for.
+# It is a monotone transform: no position changes its ranking relative to any other, only the
+# units change. tools/calibrate.py measures it per network and writes it into the weights file,
+# because the number belongs to a particular network and the next one will differ.
+EVAL_SCALE = int(_NET["eval_scale"])
 
 TRAINED = bool(_NET["trained"])
 
@@ -362,7 +384,7 @@ def forward(accumulator: np.ndarray, side_to_move: np.int64) -> np.int32:
             third += np.int32(c) * np.int32(OUTPUT[base + j + 2])
             fourth += np.int32(d) * np.int32(OUTPUT[base + j + 3])
     total = first + second + third + fourth + OUTPUT_BIAS
-    return np.int32(total * SCALE // (QA * QB))
+    return np.int32(total * EVAL_SCALE // (QA * QB))
 
 
 @njit(int64(uint64[::1], int32[::1], int32[::1]), nogil=True, cache=False)

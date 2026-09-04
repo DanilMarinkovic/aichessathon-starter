@@ -35,6 +35,18 @@ DEFAULT_OPENINGS = Path(__file__).resolve().parent / "openings.epd"
 MATE_SCORE = 30000
 # Beyond this the position is decided and a further "mistake" is not informative.
 DECIDED_CP = 900
+# A score this large is a mate, not an evaluation. Mate scores must never be summed with
+# centipawn losses: one of them is worth about 29,000 and drowns a whole game's real errors.
+# In the game that exposed this, a single entry was 97% of the reported total and pointed the
+# analysis at an endgame that was already lost, while eleven genuine 40-90cp middlegame errors
+# -- the actual reason the game was lost -- sat below it looking like rounding.
+MATE_THRESHOLD = MATE_SCORE - 1000
+
+# What kind of error a move was. Centipawn losses are comparable to each other and get summed;
+# the mate transitions are events, counted rather than added.
+ORDINARY = "cp"
+ALLOWED_MATE = "allowed mate"
+MISSED_MATE = "missed mate"
 
 
 @dataclass(frozen=True)
@@ -48,6 +60,7 @@ class Mistake:
     was_capture: bool
     best_is_capture: bool
     in_check: bool
+    kind: str = ORDINARY
 
 
 class Reference:
@@ -160,11 +173,30 @@ def analyse_game(job: tuple[str, bool, str, int]) -> list[Mistake]:
             played_value, _ = reference.score(board, restrict=move.uci())
             best_pov = best_value * sign
             played_pov = played_value * sign
-            loss = best_pov - played_pov
 
-            if abs(best_pov) <= DECIDED_CP and loss > 0:
+            # Classify before measuring. Subtracting a mate score from a centipawn one produces
+            # a number in the tens of thousands that means nothing on the centipawn scale.
+            if best_pov <= -MATE_THRESHOLD:
+                # Every move loses; there was nothing to throw away. Charging for the choice
+                # between two forced mates is how a lost endgame comes to dominate a report.
+                board.push(move)
+                continue
+            if played_pov <= -MATE_THRESHOLD:
+                kind, loss = ALLOWED_MATE, 0
+            elif best_pov >= MATE_THRESHOLD and played_pov < MATE_THRESHOLD:
+                kind, loss = MISSED_MATE, 0
+            elif best_pov >= MATE_THRESHOLD:
+                # Mate either way, just slower. Technique, not a mistake.
+                board.push(move)
+                continue
+            else:
+                kind, loss = ORDINARY, best_pov - played_pov
+
+            keep = loss > 0 if kind == ORDINARY else True
+            if abs(best_pov) <= DECIDED_CP and keep:
                 mistakes.append(
                     Mistake(
+                        kind=kind,
                         loss=int(loss),
                         fen=board.fen(),
                         played=move.uci(),
@@ -254,12 +286,27 @@ def main() -> None:
     with ProcessPoolExecutor(arguments.workers) as pool:
         found = list(pool.map(analyse_game, jobs))
 
+    every = [m for batch in found for m in batch]
+    # Mate events are not filtered by a centipawn threshold, because they do not have a
+    # centipawn size. They are reported on their own terms, above the ranked list.
+    mate_events = [m for m in every if m.kind != ORDINARY]
     mistakes = sorted(
-        (m for batch in found for m in batch if m.loss >= arguments.threshold),
+        (m for m in every if m.kind == ORDINARY and m.loss >= arguments.threshold),
         key=lambda m: -m.loss,
     )
+
+    if mate_events:
+        allowed = sum(1 for m in mate_events if m.kind == ALLOWED_MATE)
+        missed = sum(1 for m in mate_events if m.kind == MISSED_MATE)
+        print(f"\nforced mates: allowed {allowed}, missed {missed}")
+        for mistake in mate_events:
+            print(
+                f"  {mistake.kind:<12} played {mistake.played:<6} best {mistake.best:<6} "
+                f"{mistake.phase:<11} {mistake.fen}"
+            )
+
     if not mistakes:
-        print("no mistakes above the threshold")
+        print("\nno centipawn mistakes above the threshold")
         return
 
     total = sum(m.loss for m in mistakes)

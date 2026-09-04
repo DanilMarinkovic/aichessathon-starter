@@ -34,7 +34,11 @@ def engine_scores(fens: list[str]) -> np.ndarray:
         state = np.ascontiguousarray(from_board(chess.Board(fen)))
         nnue.refresh(state, accumulator, values, boards)
         out[index] = float(nnue.forward(accumulator, int(state[SIDE])))
-    return out
+    # The engine deliberately reports in calibrated units rather than the units it trained
+    # through, so undo that before comparing against the model. Without this the check reads a
+    # correctly quantised network as a scaling error, which is exactly the alarm it exists to
+    # raise and would be a false one. Uncalibrated networks have the two equal and divide by one.
+    return out * (nnue.SCALE / nnue.EVAL_SCALE)
 
 
 def model_scores(model: Network, fens: list[str]) -> np.ndarray:
