@@ -26,7 +26,13 @@ from position import HASH, from_board
 from searcher import BEST_SCORE, STOP
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "openings.epd"
-SHALLOW_PLIES = 8
+
+# Each line is emitted at these depths, and at its full length. More positions raise the
+# ceiling on distinct games, which is what sets the smallest Elo change the rig can resolve:
+# under fixed nodes the engine is deterministic, so replaying an opening replays the game.
+# Lines that share their early moves collapse to the same position at the shallow depths and
+# are deduplicated, so this yields fewer positions than lines x depths.
+TRUNCATIONS = (8, 12)
 
 LINES: tuple[tuple[str, str], ...] = (
     # --- 1.e4 e5 ---
@@ -153,9 +159,9 @@ def _positions(name: str, line: str) -> list[tuple[str, str]]:
             board.push_san(san)
         except ValueError as error:
             raise SystemExit(f"{name}: illegal move {san!r} at ply {index}: {error}") from None
-        if index == SHALLOW_PLIES:
+        if index in TRUNCATIONS:
             fens.append((f"{name} (ply {index})", board.fen()))
-    if len(moves) > SHALLOW_PLIES:
+    if len(moves) not in TRUNCATIONS:
         fens.append((f"{name} (ply {len(moves)})", board.fen()))
     return fens
 

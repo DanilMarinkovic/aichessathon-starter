@@ -12,8 +12,14 @@ Configured by environment variables, because the harness only ever passes a dire
 
     UCI_ENGINE    path to the engine binary (required)
     UCI_ELO       cap the engine's strength at this rating, via UCI_LimitStrength
-    UCI_MOVETIME  milliseconds per move, default 100
+    UCI_NODES     nodes per move; preferred, because it does not depend on machine load
+    UCI_MOVETIME  milliseconds per move, used only when UCI_NODES is unset. Default 100
     UCI_THREADS   engine threads, default 1 to match the platform's single core
+
+Prefer UCI_NODES for anything being measured. A movetime limit is wall clock, so a loaded
+machine gets the reference engine less work per move and it plays weaker, which would quietly
+move the yardstick between runs. A node limit is load-independent, matching how the agent under
+test is held fixed.
 """
 
 import os
@@ -22,6 +28,7 @@ import sys
 
 ENGINE = os.environ.get("UCI_ENGINE", "")
 ELO = os.environ.get("UCI_ELO", "")
+NODES = int(os.environ.get("UCI_NODES", "0"))
 MOVETIME = int(os.environ.get("UCI_MOVETIME", "100"))
 THREADS = os.environ.get("UCI_THREADS", "1")
 
@@ -71,13 +78,17 @@ def _setup() -> None:
     _send("ucinewgame")
     _send("isready")
     _read_until("readyok")
-    print(f"uci adapter ready: {ENGINE} elo={ELO or 'full'} movetime={MOVETIME}ms", file=sys.stderr)
+    strength = ELO or "full"
+    limit = f"{NODES} nodes" if NODES > 0 else f"{MOVETIME}ms"
+    print(f"uci adapter ready: {ENGINE} elo={strength} {limit}", file=sys.stderr)
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
-    budget = min(MOVETIME, max(10, time_left_ms // 40))
     _send(f"position fen {fen}")
-    _send(f"go movetime {budget}")
+    if NODES > 0:
+        _send(f"go nodes {NODES}")
+    else:
+        _send(f"go movetime {min(MOVETIME, max(10, time_left_ms // 40))}")
     line = _read_until("bestmove")
     move = line.split()[1]
     if move in ("(none)", "0000"):

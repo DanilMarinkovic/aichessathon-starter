@@ -6,3 +6,6 @@ submission.zip
 *.pgn
 agent.zip
 versions/
+
+aire/data/
+aire/logs/
