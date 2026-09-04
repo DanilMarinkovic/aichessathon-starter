@@ -21,9 +21,10 @@ import time
 import chess
 import numpy as np
 
+import nnue
 import searcher
 from position import HASH, from_board, to_uci
-from searcher import BEST_DEPTH, BEST_SCORE, MAX_PLY, NODES, PATH_LIMIT, STOP
+from searcher import BEST_DEPTH, BEST_SCORE, MAX_PLY, NODES, PATH_LIMIT, STOP, USE_NNUE
 
 # Wall time the referee charges us that we never see: the JSON round trip, building the board,
 # and handing the move back. Measured at a few milliseconds; held well clear of that.
@@ -188,6 +189,16 @@ def _raise_flag() -> None:
     searcher.CONTROL[STOP] = 1
 
 
+def _select_evaluation() -> None:
+    """Play with the network if one shipped, and with the hand evaluation otherwise.
+
+    Set before warm-up so whichever path will run is the path numba compiles inside the import
+    budget rather than on the first move.
+    """
+    searcher.CONTROL[USE_NNUE] = 1 if nnue.TRAINED else 0
+    print(f"evaluation: {'network' if nnue.TRAINED else 'hand-written'}")
+
+
 def _warm() -> None:
     """Compile every jitted path inside the 60 second import budget, not on the clock.
 
@@ -209,4 +220,5 @@ def _warm() -> None:
     _history.clear()
 
 
+_select_evaluation()
 _warm()

@@ -16,9 +16,9 @@
 #SBATCH --job-name=chess-measure
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=168
-#SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=32G
+#SBATCH --time=01:00:00
 #SBATCH --output=aire/logs/measure-%j.out
 
 set -euo pipefail
@@ -34,6 +34,6 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMBA_NUM_THREADS=1
 
-WORKERS=${WORKERS:-120}
+WORKERS=${WORKERS:-48}
 echo "node $(hostname), $(nproc) cores, $WORKERS workers"
 uv run python tools/measure.py "$@" --workers "$WORKERS"

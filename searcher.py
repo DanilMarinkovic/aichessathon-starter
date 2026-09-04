@@ -37,6 +37,7 @@ from movegen import MAX_MOVES, generate
 from nnue import HIDDEN as NNUE_HIDDEN
 from nnue import advance as nnue_advance
 from nnue import forward as nnue_forward
+from nnue import new_cache as nnue_new_cache
 from nnue import refresh as nnue_refresh
 from position import (
     EN_PASSANT,
@@ -97,6 +98,9 @@ CONTROL = np.zeros(8, dtype=np.int64)
 # the array's identity into the compiled code and reads its contents at run time, so the search
 # can index it as a global without threading it through every signature.
 ACCUMULATORS = np.zeros((MAX_PLY + 8, 2, NNUE_HIDDEN), dtype=np.int16)
+# The accumulator refresh table: one cached accumulator per bucket, with the bitboards it was
+# built from, so a king crossing a bucket boundary costs a small diff instead of a rebuild.
+CACHE_VALUES, CACHE_BOARDS = nnue_new_cache()
 
 PIECE_VALUE = np.array([0, 100, 320, 330, 500, 900, 20000], dtype=np.int64)
 
@@ -237,18 +241,24 @@ def score_position(
 
 
 @njit(
-    int64(uint64[:, ::1], int16[:, :, ::1], int64[::1], int64),
+    int64(uint64[:, ::1], int16[:, :, ::1], int16[:, ::1], uint64[:, ::1], int64[::1], int64),
     nogil=True,
     cache=False,
     inline="always",
 )
 def push_accumulator(
-    states: np.ndarray, accumulators: np.ndarray, control: np.ndarray, ply: np.int64
+    states: np.ndarray,
+    accumulators: np.ndarray,
+    cache_values: np.ndarray,
+    cache_boards: np.ndarray,
+    control: np.ndarray,
+    ply: np.int64,
 ) -> np.int64:
     """Carry the accumulator one ply forward, after a move has been made into ply + 1."""
     if control[USE_NNUE] != 0:
         nnue_advance(
-            states[ply], states[ply + 1], accumulators[ply], accumulators[ply + 1]
+            states[ply], states[ply + 1], accumulators[ply], accumulators[ply + 1],
+            cache_values, cache_boards,
         )
     return 0
 
@@ -257,6 +267,8 @@ def push_accumulator(
     int32(
         uint64[:, ::1],
         int16[:, :, ::1],
+        int16[:, ::1],
+        uint64[:, ::1],
         int32[:, ::1],
         int32[:, ::1],
         int64[::1],
@@ -270,6 +282,8 @@ def push_accumulator(
 def quiescence(
     states: np.ndarray,
     accumulators: np.ndarray,
+    cache_values: np.ndarray,
+    cache_boards: np.ndarray,
     moves: np.ndarray,
     order: np.ndarray,
     control: np.ndarray,
@@ -317,8 +331,11 @@ def quiescence(
 
         if make_move(states[ply], move, states[ply + 1]) == 0:
             continue
-        push_accumulator(states, accumulators, control, ply)
-        score = -quiescence(states, accumulators, moves, order, control, ply + 1, -beta, -alpha)
+        push_accumulator(states, accumulators, cache_values, cache_boards, control, ply)
+        score = -quiescence(
+            states, accumulators, cache_values, cache_boards, moves, order, control,
+            ply + 1, -beta, -alpha,
+        )
         if control[STOP] != 0:
             return np.int32(0)
         if score > best:
@@ -334,6 +351,8 @@ def quiescence(
     int32(
         uint64[:, ::1],
         int16[:, :, ::1],
+        int16[:, ::1],
+        uint64[:, ::1],
         int32[:, ::1],
         int32[:, ::1],
         int32[:, ::1],
@@ -355,6 +374,8 @@ def quiescence(
 def negamax(
     states: np.ndarray,
     accumulators: np.ndarray,
+    cache_values: np.ndarray,
+    cache_boards: np.ndarray,
     moves: np.ndarray,
     order: np.ndarray,
     killers: np.ndarray,
@@ -400,7 +421,10 @@ def negamax(
     if checked != 0:
         depth += 1
     if depth <= 0:
-        return quiescence(states, accumulators, moves, order, control, ply, alpha, beta)
+        return quiescence(
+        states, accumulators, cache_values, cache_boards, moves, order, control,
+        ply, alpha, beta,
+    )
 
     key = states[ply, HASH]
     slot = np.int64(key & TT_MASK)
@@ -435,10 +459,11 @@ def negamax(
             make_null(states[ply], states[ply + 1])
             # A null move leaves every piece where it was, so the bitboard diff is empty and
             # this degenerates to a copy. No special case needed.
-            push_accumulator(states, accumulators, control, ply)
+            push_accumulator(states, accumulators, cache_values, cache_boards, control, ply)
             path[root_offset + ply + 1] = states[ply + 1, HASH]
             score = -negamax(
-                states, accumulators, moves, order, killers, history,
+                states, accumulators, cache_values, cache_boards,
+                moves, order, killers, history,
                 tt_key, tt_data, path, control,
                 ply + 1, depth - 1 - reduction, np.int32(-beta), np.int32(-beta + 1),
                 root_offset, 0,
@@ -479,13 +504,14 @@ def negamax(
         )
         if make_move(states[ply], move, states[ply + 1]) == 0:
             continue
-        push_accumulator(states, accumulators, control, ply)
+        push_accumulator(states, accumulators, cache_values, cache_boards, control, ply)
         path[root_offset + ply + 1] = states[ply + 1, HASH]
         played += 1
 
         if played == 1:
             score = -negamax(
-                states, accumulators, moves, order, killers, history,
+                states, accumulators, cache_values, cache_boards,
+                moves, order, killers, history,
                 tt_key, tt_data, path, control,
                 ply + 1, depth - 1, np.int32(-beta), np.int32(-alpha), root_offset, 1,
             )
@@ -500,20 +526,23 @@ def negamax(
                 if reduction < 0:
                     reduction = 0
             score = -negamax(
-                states, accumulators, moves, order, killers, history,
+                states, accumulators, cache_values, cache_boards,
+                moves, order, killers, history,
                 tt_key, tt_data, path, control,
                 ply + 1, depth - 1 - reduction, np.int32(-alpha - 1), np.int32(-alpha),
                 root_offset, 1,
             )
             if score > alpha and reduction > 0:
                 score = -negamax(
-                    states, accumulators, moves, order, killers, history,
+                    states, accumulators, cache_values, cache_boards,
+                moves, order, killers, history,
                 tt_key, tt_data, path, control,
                     ply + 1, depth - 1, np.int32(-alpha - 1), np.int32(-alpha), root_offset, 1,
                 )
             if score > alpha and score < beta:
                 score = -negamax(
-                    states, accumulators, moves, order, killers, history,
+                    states, accumulators, cache_values, cache_boards,
+                moves, order, killers, history,
                 tt_key, tt_data, path, control,
                     ply + 1, depth - 1, np.int32(-beta), np.int32(-alpha), root_offset, 1,
                 )
@@ -567,6 +596,8 @@ def negamax(
     int64(
         uint64[:, ::1],
         int16[:, :, ::1],
+        int16[:, ::1],
+        uint64[:, ::1],
         int32[:, ::1],
         int32[:, ::1],
         int32[:, ::1],
@@ -584,6 +615,8 @@ def negamax(
 def search_position(
     states: np.ndarray,
     accumulators: np.ndarray,
+    cache_values: np.ndarray,
+    cache_boards: np.ndarray,
     moves: np.ndarray,
     order: np.ndarray,
     killers: np.ndarray,
@@ -622,7 +655,8 @@ def search_position(
                 alpha = np.int32(-INFINITY)
                 beta = np.int32(INFINITY)
             score = negamax(
-                states, accumulators, moves, order, killers, history,
+                states, accumulators, cache_values, cache_boards,
+                moves, order, killers, history,
                 tt_key, tt_data, path, control,
                 0, depth, alpha, beta, root_offset, 1,
             )
@@ -652,10 +686,11 @@ def run(max_depth: int, root_offset: int, node_limit: int) -> int:
     CONTROL[NODE_LIMIT] = node_limit
     if CONTROL[USE_NNUE] != 0:
         # Everything deeper is reached by delta, so the root is the one place it is built.
-        nnue_refresh(STATES[0], ACCUMULATORS[0])
+        nnue_refresh(STATES[0], ACCUMULATORS[0], CACHE_VALUES, CACHE_BOARDS)
     return int(
         search_position(
-            STATES, ACCUMULATORS, MOVES, ORDER, KILLERS, HISTORY, TT_KEY, TT_DATA, PATH, CONTROL,
+            STATES, ACCUMULATORS, CACHE_VALUES, CACHE_BOARDS,
+            MOVES, ORDER, KILLERS, HISTORY, TT_KEY, TT_DATA, PATH, CONTROL,
             max_depth, root_offset,
         )
     )

@@ -116,9 +116,11 @@ def _play_batch(job: tuple[list[str], int, int, int]) -> list[tuple[str, str]]:
 class Labeller:
     def __init__(self, path: str, depth: int) -> None:
         self.depth = depth
+        # stderr is captured rather than discarded. A reference engine that dies on startup
+        # says why on stderr, and throwing that away turns a one-line diagnosis into a guess.
         self._process = subprocess.Popen(
             [path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
         )
         self._send("uci")
         self._await("uciok")
@@ -131,12 +133,30 @@ class Labeller:
         self._process.stdin.write(command + "\n")
         self._process.stdin.flush()
 
+    def _died(self, waiting_for: str) -> RuntimeError:
+        code = self._process.poll()
+        detail = ""
+        if self._process.stderr is not None:
+            detail = self._process.stderr.read().strip()[:400]
+        hint = ""
+        if code is not None and code < 0:
+            hint = f" Killed by signal {-code}."
+            if -code == 4:
+                # SIGILL. Login nodes and compute nodes are often different hardware, so a
+                # binary chosen by reading /proc/cpuinfo during setup can be built for a wider
+                # instruction set than the node the job actually lands on.
+                hint += " That is an illegal instruction: the binary is built for a wider"
+                hint += " instruction set than this node supports. Reinstall a plainer build."
+        return RuntimeError(
+            f"reference engine died waiting for {waiting_for!r} (exit {code}).{hint} {detail}"
+        )
+
     def _await(self, token: str) -> None:
         assert self._process.stdout is not None
         while True:
             line = self._process.stdout.readline()
             if not line:
-                raise RuntimeError("labeller died")
+                raise self._died(token)
             if line.startswith(token):
                 return
 
@@ -149,7 +169,7 @@ class Labeller:
         while True:
             line = self._process.stdout.readline()
             if not line:
-                raise RuntimeError("labeller died mid-search")
+                raise self._died("bestmove")
             if line.startswith("info ") and " score " in line:
                 parts = line.split()
                 kind = parts[parts.index("score") + 1]
