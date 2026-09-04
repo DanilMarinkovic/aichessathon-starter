@@ -18,7 +18,7 @@ A transposition entry is packed into one int64 so the table is two arrays instea
 """
 
 import numpy as np
-from numba import int32, int64, njit, uint64
+from numba import int16, int32, int64, njit, uint64
 
 from bitboards import (
     BISHOP,
@@ -34,6 +34,10 @@ from bitboards import (
 )
 from evaluate import evaluate
 from movegen import MAX_MOVES, generate
+from nnue import HIDDEN as NNUE_HIDDEN
+from nnue import advance as nnue_advance
+from nnue import forward as nnue_forward
+from nnue import refresh as nnue_refresh
 from position import (
     EN_PASSANT,
     EP,
@@ -73,6 +77,9 @@ NODE_LIMIT = 2
 BEST_MOVE = 3
 BEST_SCORE = 4
 BEST_DEPTH = 5
+# Which evaluation to use. Lives in CONTROL rather than a global because numba freezes a
+# global array into compiled code as a read-only constant and folds the branch away.
+USE_NNUE = 6
 
 PATH_LIMIT = 2048
 
@@ -85,6 +92,11 @@ KILLERS = np.zeros((MAX_PLY + 8, 2), dtype=np.int32)
 HISTORY = np.zeros((12, 64), dtype=np.int64)
 PATH = np.zeros(PATH_LIMIT + MAX_PLY + 8, dtype=np.uint64)
 CONTROL = np.zeros(8, dtype=np.int64)
+
+# One network accumulator per ply, mirroring how positions are already stacked. numba freezes
+# the array's identity into the compiled code and reads its contents at run time, so the search
+# can index it as a global without threading it through every signature.
+ACCUMULATORS = np.zeros((MAX_PLY + 8, 2, NNUE_HIDDEN), dtype=np.int16)
 
 PIECE_VALUE = np.array([0, 100, 320, 330, 500, 900, 20000], dtype=np.int64)
 
@@ -210,12 +222,54 @@ def pick_move(
 
 
 @njit(
-    int32(uint64[:, ::1], int32[:, ::1], int32[:, ::1], int64[::1], int64, int32, int32),
+    int32(uint64[:, ::1], int16[:, :, ::1], int64[::1], int64),
+    nogil=True,
+    cache=False,
+    inline="always",
+)
+def score_position(
+    states: np.ndarray, accumulators: np.ndarray, control: np.ndarray, ply: np.int64
+) -> np.int32:
+    """Whichever evaluation is in force. The branch is on a value that never changes mid-search."""
+    if control[USE_NNUE] != 0:
+        return nnue_forward(accumulators[ply], np.int64(states[ply, SIDE]))
+    return np.int32(evaluate(states[ply]))
+
+
+@njit(
+    int64(uint64[:, ::1], int16[:, :, ::1], int64[::1], int64),
+    nogil=True,
+    cache=False,
+    inline="always",
+)
+def push_accumulator(
+    states: np.ndarray, accumulators: np.ndarray, control: np.ndarray, ply: np.int64
+) -> np.int64:
+    """Carry the accumulator one ply forward, after a move has been made into ply + 1."""
+    if control[USE_NNUE] != 0:
+        nnue_advance(
+            states[ply], states[ply + 1], accumulators[ply], accumulators[ply + 1]
+        )
+    return 0
+
+
+@njit(
+    int32(
+        uint64[:, ::1],
+        int16[:, :, ::1],
+        int32[:, ::1],
+        int32[:, ::1],
+        int64[::1],
+        int64,
+        int32,
+        int32,
+    ),
     nogil=True,
     cache=False,
 )
 def quiescence(
     states: np.ndarray,
+    accumulators: np.ndarray,
     moves: np.ndarray,
     order: np.ndarray,
     control: np.ndarray,
@@ -231,7 +285,7 @@ def quiescence(
         control[STOP] = 1
         return np.int32(0)
 
-    stand_pat = np.int32(evaluate(states[ply]))
+    stand_pat = score_position(states, accumulators, control, ply)
     if ply >= MAX_PLY - 2:
         return stand_pat
     if stand_pat >= beta:
@@ -263,7 +317,8 @@ def quiescence(
 
         if make_move(states[ply], move, states[ply + 1]) == 0:
             continue
-        score = -quiescence(states, moves, order, control, ply + 1, -beta, -alpha)
+        push_accumulator(states, accumulators, control, ply)
+        score = -quiescence(states, accumulators, moves, order, control, ply + 1, -beta, -alpha)
         if control[STOP] != 0:
             return np.int32(0)
         if score > best:
@@ -278,6 +333,7 @@ def quiescence(
 @njit(
     int32(
         uint64[:, ::1],
+        int16[:, :, ::1],
         int32[:, ::1],
         int32[:, ::1],
         int32[:, ::1],
@@ -298,6 +354,7 @@ def quiescence(
 )
 def negamax(
     states: np.ndarray,
+    accumulators: np.ndarray,
     moves: np.ndarray,
     order: np.ndarray,
     killers: np.ndarray,
@@ -329,7 +386,7 @@ def negamax(
         ):
             return np.int32(0)
         if ply >= MAX_PLY - 8:
-            return np.int32(evaluate(states[ply]))
+            return score_position(states, accumulators, control, ply)
 
         # Mate distance pruning: a shorter mate found elsewhere makes this subtree irrelevant.
         if np.int32(-MATE + ply) > alpha:
@@ -343,7 +400,7 @@ def negamax(
     if checked != 0:
         depth += 1
     if depth <= 0:
-        return quiescence(states, moves, order, control, ply, alpha, beta)
+        return quiescence(states, accumulators, moves, order, control, ply, alpha, beta)
 
     key = states[ply, HASH]
     slot = np.int64(key & TT_MASK)
@@ -367,7 +424,7 @@ def negamax(
                 return stored
 
     pv_node = beta - alpha > 1
-    static = np.int32(0) if checked != 0 else np.int32(evaluate(states[ply]))
+    static = np.int32(0) if checked != 0 else score_position(states, accumulators, control, ply)
 
     if not pv_node and checked == 0 and abs(beta) < MATE_THRESHOLD:
         # Reverse futility: so far ahead that conceding a few pawns would still hold beta.
@@ -376,9 +433,13 @@ def negamax(
         if can_null != 0 and depth >= 3 and static >= beta and has_pieces(states[ply]) != 0:
             reduction = 2 + depth // 6
             make_null(states[ply], states[ply + 1])
+            # A null move leaves every piece where it was, so the bitboard diff is empty and
+            # this degenerates to a copy. No special case needed.
+            push_accumulator(states, accumulators, control, ply)
             path[root_offset + ply + 1] = states[ply + 1, HASH]
             score = -negamax(
-                states, moves, order, killers, history, tt_key, tt_data, path, control,
+                states, accumulators, moves, order, killers, history,
+                tt_key, tt_data, path, control,
                 ply + 1, depth - 1 - reduction, np.int32(-beta), np.int32(-beta + 1),
                 root_offset, 0,
             )
@@ -418,12 +479,14 @@ def negamax(
         )
         if make_move(states[ply], move, states[ply + 1]) == 0:
             continue
+        push_accumulator(states, accumulators, control, ply)
         path[root_offset + ply + 1] = states[ply + 1, HASH]
         played += 1
 
         if played == 1:
             score = -negamax(
-                states, moves, order, killers, history, tt_key, tt_data, path, control,
+                states, accumulators, moves, order, killers, history,
+                tt_key, tt_data, path, control,
                 ply + 1, depth - 1, np.int32(-beta), np.int32(-alpha), root_offset, 1,
             )
         else:
@@ -437,18 +500,21 @@ def negamax(
                 if reduction < 0:
                     reduction = 0
             score = -negamax(
-                states, moves, order, killers, history, tt_key, tt_data, path, control,
+                states, accumulators, moves, order, killers, history,
+                tt_key, tt_data, path, control,
                 ply + 1, depth - 1 - reduction, np.int32(-alpha - 1), np.int32(-alpha),
                 root_offset, 1,
             )
             if score > alpha and reduction > 0:
                 score = -negamax(
-                    states, moves, order, killers, history, tt_key, tt_data, path, control,
+                    states, accumulators, moves, order, killers, history,
+                tt_key, tt_data, path, control,
                     ply + 1, depth - 1, np.int32(-alpha - 1), np.int32(-alpha), root_offset, 1,
                 )
             if score > alpha and score < beta:
                 score = -negamax(
-                    states, moves, order, killers, history, tt_key, tt_data, path, control,
+                    states, accumulators, moves, order, killers, history,
+                tt_key, tt_data, path, control,
                     ply + 1, depth - 1, np.int32(-beta), np.int32(-alpha), root_offset, 1,
                 )
 
@@ -500,6 +566,7 @@ def negamax(
 @njit(
     int64(
         uint64[:, ::1],
+        int16[:, :, ::1],
         int32[:, ::1],
         int32[:, ::1],
         int32[:, ::1],
@@ -516,6 +583,7 @@ def negamax(
 )
 def search_position(
     states: np.ndarray,
+    accumulators: np.ndarray,
     moves: np.ndarray,
     order: np.ndarray,
     killers: np.ndarray,
@@ -554,7 +622,8 @@ def search_position(
                 alpha = np.int32(-INFINITY)
                 beta = np.int32(INFINITY)
             score = negamax(
-                states, moves, order, killers, history, tt_key, tt_data, path, control,
+                states, accumulators, moves, order, killers, history,
+                tt_key, tt_data, path, control,
                 0, depth, alpha, beta, root_offset, 1,
             )
             if control[STOP] != 0:
@@ -581,18 +650,24 @@ def search_position(
 def run(max_depth: int, root_offset: int, node_limit: int) -> int:
     """Search the position already loaded into STATES[0]."""
     CONTROL[NODE_LIMIT] = node_limit
+    if CONTROL[USE_NNUE] != 0:
+        # Everything deeper is reached by delta, so the root is the one place it is built.
+        nnue_refresh(STATES[0], ACCUMULATORS[0])
     return int(
         search_position(
-            STATES, MOVES, ORDER, KILLERS, HISTORY, TT_KEY, TT_DATA, PATH, CONTROL,
+            STATES, ACCUMULATORS, MOVES, ORDER, KILLERS, HISTORY, TT_KEY, TT_DATA, PATH, CONTROL,
             max_depth, root_offset,
         )
     )
 
 
 def reset() -> None:
-    """Clear everything that must not leak between games."""
+    """Clear everything that must not leak between games. Which evaluation is in force is
+    configuration rather than game state, so it survives."""
+    evaluation = CONTROL[USE_NNUE]
     TT_KEY.fill(0)
     TT_DATA.fill(0)
     HISTORY.fill(0)
     KILLERS.fill(0)
     CONTROL.fill(0)
+    CONTROL[USE_NNUE] = evaluation

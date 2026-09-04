@@ -43,5 +43,5 @@ files = ["agent.py", "harness"]
 # not by the type checker. agent.py, which is the actual contract with the platform, stays
 # strictly checked.
 [[tool.mypy.overrides]]
-module = ["bitboards", "position", "movegen", "evaluate", "searcher"]
+module = ["bitboards", "position", "movegen", "evaluate", "searcher", "nnue"]
 ignore_errors = true

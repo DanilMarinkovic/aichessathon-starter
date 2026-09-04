@@ -20,6 +20,7 @@ Sharding lets one array task write one file. Concatenate them afterwards.
 import argparse
 import io
 import os
+import random
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -31,23 +32,85 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import chess
 import chess.pgn
 
-from harness.referee import play_match
-from harness.sandbox import local
-
 DEFAULT_OPENINGS = Path(__file__).resolve().parent / "openings.epd"
 MATE_SCORE = 30000
 SKIP_OPENING_PLIES = 8
 SAMPLE_EVERY = 2
 
 
-def _init(nodes: int) -> None:
-    os.environ["CHESSATHON_FIXED_NODES"] = str(nodes)
+def _selfplay(fen: str, nodes: int, rng: random.Random, random_plies: int) -> tuple[str, str]:
+    """Play one game in this process, reusing the already-compiled engine.
+
+    Not through the harness. The harness starts a fresh process per game because the platform
+    does, and that fidelity is what makes match.py's measurements honest. Here we only want
+    positions, and a process start costs eleven seconds of numba compilation against about two
+    seconds of chess, so games are played in-process instead.
+
+    A few random plies are played first. Under a fixed node count the engine is deterministic,
+    so without them every game from a given opening would be the same game, and the data would
+    be a handful of lines repeated thousands of times.
+    """
+    import numpy as np
+
+    import searcher
+    from position import HASH, from_board, to_uci
+    from searcher import STOP
+
+    board = chess.Board(fen)
+    for _ in range(random_plies):
+        legal = list(board.legal_moves)
+        if not legal:
+            break
+        board.push(rng.choice(legal))
+
+    searcher.reset()
+    history: list[int] = []
+    while not board.is_game_over(claim_draw=True) and len(board.move_stack) < 300:
+        state = from_board(board)
+        history.append(int(state[HASH]))
+        searcher.STATES[0] = state
+        searcher.PATH[:] = 0
+        for index, key in enumerate(history):
+            searcher.PATH[index] = np.uint64(key)
+        searcher.CONTROL[STOP] = 0
+        packed = searcher.run(64, len(history) - 1, nodes)
+        try:
+            move = chess.Move.from_uci(to_uci(packed) if packed else "")
+        except ValueError:
+            break
+        if move not in board.legal_moves:
+            break
+        board.push(move)
+
+    outcome = board.outcome(claim_draw=True)
+    if outcome is not None and outcome.winner is not None:
+        result = "white" if outcome.winner == chess.WHITE else "black"
+    elif outcome is not None:
+        result = "draw"
+    else:
+        result = _adjudicate(board)
+    return str(chess.pgn.Game.from_board(board)), result
 
 
-def _play(job: tuple[str, Path, int]) -> tuple[str, str]:
-    fen, agent, _nodes = job
-    outcome = play_match(local(agent), local(agent), 600_000, 0, start_fen=fen)
-    return outcome.pgn, outcome.result
+def _adjudicate(board: chess.Board) -> str:
+    """Material, the same way the referee settles a game that hits the ply cap."""
+    values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+    balance = sum(
+        value * (len(board.pieces(piece, chess.WHITE)) - len(board.pieces(piece, chess.BLACK)))
+        for piece, value in values.items()
+    )
+    if balance > 0:
+        return "white"
+    if balance < 0:
+        return "black"
+    return "draw"
+
+
+def _play_batch(job: tuple[list[str], int, int, int]) -> list[tuple[str, str]]:
+    """One worker plays many games, so the engine is compiled once rather than per game."""
+    fens, nodes, seed, random_plies = job
+    rng = random.Random(seed)
+    return [_selfplay(fen, nodes, rng, random_plies) for fen in fens]
 
 
 class Labeller:
@@ -149,6 +212,9 @@ def main() -> None:
     parser.add_argument("--openings", type=Path, default=DEFAULT_OPENINGS)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--shard", type=int, default=0, help="array task id, offsets openings")
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--random-plies", type=int, default=4,
+                        help="random moves before self-play, to vary the games")
     parser.add_argument("--out", type=Path, required=True)
     arguments = parser.parse_args()
 
@@ -157,18 +223,21 @@ def main() -> None:
     lines = arguments.openings.read_text().splitlines()
     openings = [line.strip() for line in lines if line.strip()]
 
-    agent = arguments.agent.resolve()
-    jobs = [
-        (openings[(arguments.shard * arguments.games + index) % len(openings)],
-         agent, arguments.nodes)
-        for index in range(arguments.games)
-    ]
+    # One batch per worker, so each worker pays the engine's compile cost once.
+    per_worker = max(1, -(-arguments.games // arguments.workers))
+    jobs = []
+    for worker in range(arguments.workers):
+        first = worker * per_worker
+        fens = [
+            openings[(arguments.shard * arguments.games + index) % len(openings)]
+            for index in range(first, min(first + per_worker, arguments.games))
+        ]
+        if fens:
+            jobs.append((fens, arguments.nodes, arguments.seed + worker, arguments.random_plies))
 
     print(f"shard {arguments.shard}: playing {arguments.games} games...", flush=True)
-    with ProcessPoolExecutor(
-        arguments.workers, initializer=_init, initargs=(arguments.nodes,)
-    ) as pool:
-        played = list(pool.map(_play, jobs))
+    with ProcessPoolExecutor(arguments.workers) as pool:
+        played = [game for batch in pool.map(_play_batch, jobs) for game in batch]
 
     print(f"shard {arguments.shard}: labelling at depth {arguments.depth}...", flush=True)
     label_jobs = [(pgn, result, arguments.engine, arguments.depth) for pgn, result in played]
