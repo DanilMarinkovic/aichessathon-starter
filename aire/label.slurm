@@ -45,6 +45,12 @@ GAMES=${GAMES:-6000}
 WORKERS=${WORKERS:-32}
 DEPTH=${DEPTH:-10}
 SEED=${SEED:-$((SHARD * 1000 + 1))}
+# How far the game is randomised off the opening before self-play takes over. There are only
+# 198 openings, so at a few hundred shards each one is replayed thousands of times and the
+# positions become heavily correlated; correlated positions inflate the row count without
+# adding information. More random plies widen the distribution, and the deliberately bad
+# positions they produce are ones the network still has to evaluate.
+RANDOM_PLIES=${RANDOM_PLIES:-4}
 
 echo "shard $SHARD on $(hostname), $(nproc) cores"
 
@@ -70,4 +76,5 @@ uv run python tools/label.py \
   --workers "$WORKERS" \
   --depth "$DEPTH" \
   --seed "$SEED" \
+  --random-plies "$RANDOM_PLIES" \
   --out "aire/data/shard-${SHARD}.epd"

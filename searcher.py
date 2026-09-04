@@ -55,6 +55,7 @@ from position import (
     move_to,
     piece_on,
 )
+from see import see_ge
 
 MAX_PLY = 96
 MATE = 30000
@@ -200,7 +201,13 @@ def score_move(state: np.ndarray, move: np.int32, tt_move: np.int32) -> np.int64
     victim = PAWN if move_flag(move) == EN_PASSANT else piece_on(state, move_to(move), 1 - side)
     if victim != 0:
         attacker = piece_on(state, move_from(move), side)
-        return 1_000_000 + PIECE_VALUE[victim] * 16 - PIECE_VALUE[attacker]
+        rank = PIECE_VALUE[victim] * 16 - PIECE_VALUE[attacker]
+        # Most valuable victim first is a good guess and a bad answer: it rates a pawn taking a
+        # defended queen above a clean win of a rook. SEE separates the two, and losing captures
+        # drop below the quiet moves rather than being tried first.
+        if see_ge(state, move, np.int64(0)) != 0:
+            return 1_000_000 + rank
+        return 100_000 + rank
     if move_promotion(move) == QUEEN:
         return 900_000
     return 0
@@ -327,6 +334,12 @@ def quiescence(
             and move_promotion(move) == 0
             and stand_pat + np.int32(PIECE_VALUE[victim] + 200) < alpha
         ):
+            continue
+
+        # A capture that loses material does not become good further down the exchange, and
+        # searching it costs a node plus its whole subtree. Promotions are exempt: their value
+        # is in what arrives on the square, not in what the exchange settles at.
+        if move_promotion(move) == 0 and see_ge(states[ply], move, np.int64(0)) == 0:
             continue
 
         if make_move(states[ply], move, states[ply + 1]) == 0:

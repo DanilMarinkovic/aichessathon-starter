@@ -175,6 +175,17 @@ def main() -> None:
             )
     print(f"{len(target):,} positions, {nnue.BUCKETS} buckets, {nnue.HIDDEN} hidden")
 
+    # Rows arrive in shard order, so the tail of the file is one shard's self-play games rather
+    # than a sample of the whole set. The held-out slice is taken from the end, so without this
+    # the validation curve tracks a single shard's quirks and cannot say whether the network
+    # generalises. Permuting once, with a fixed seed, makes the holdout representative and keeps
+    # the split reproducible across runs. Done array by array so only one copy exists at a time.
+    shuffle = np.random.default_rng(0).permutation(len(target))
+    white = white[shuffle]
+    black = black[shuffle]
+    target = target[shuffle]
+    stm = stm[shuffle]
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         # Use every core the job was given. The single-thread rule is a constraint on the

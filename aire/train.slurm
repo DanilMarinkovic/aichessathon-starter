@@ -11,6 +11,13 @@
 # Encoding is the slow part and it is single threaded, so --cache is used to do it once; later
 # runs over the same data start straight into training.
 #
+# Sizing. Each position costs about 268 bytes of index arrays, and the int64 tensors torch wants
+# roughly triple that while both copies are live, so budget around 800 bytes per position: 40 GB
+# at fifty million, 80 GB at a hundred million. The request below covers a hundred million with
+# room to spare. Encoding runs at roughly a million positions a minute, and it is the reason the
+# time limit is hours rather than one; training itself is about eleven minutes per epoch at
+# fifty million positions on 64 cores.
+#
 # Runs on CPU, on the default partition, deliberately. This network is small enough that CPU
 # training is a matter of minutes, the GPU partition is usually full, and its nodes have 24
 # cores against 168 here. If a GPU is ever wanted:
@@ -19,9 +26,9 @@
 #SBATCH --job-name=chess-train
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=192G
+#SBATCH --time=08:00:00
 #SBATCH --output=aire/logs/train-%j.out
 
 set -euo pipefail

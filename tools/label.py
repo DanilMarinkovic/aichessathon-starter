@@ -35,7 +35,13 @@ import chess.pgn
 DEFAULT_OPENINGS = Path(__file__).resolve().parent / "openings.epd"
 MATE_SCORE = 30000
 SKIP_OPENING_PLIES = 8
-SAMPLE_EVERY = 2
+# Odd, and that is the whole point. Sampling `ply % 2 == 0` from a game that opens with white
+# to move yields white-to-move positions and nothing else: the first dataset built this way was
+# 221,664 white to 2,180 black, the black ones arriving only from the few openings that happen
+# to leave black on move. An odd stride alternates parity within every game instead, so both
+# sides are represented. The cost is roughly a third fewer positions per game, which is cheap
+# next to training on half of chess.
+SAMPLE_EVERY = 3
 
 
 def _selfplay(fen: str, nodes: int, rng: random.Random, random_plies: int) -> tuple[str, str]:

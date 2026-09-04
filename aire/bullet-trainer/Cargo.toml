@@ -1,0 +1,24 @@
+# Our network, described in bullet's terms.
+#
+# The path dependency assumes the layout aire/bullet-setup.sh creates: this repository at
+# $HOME/aichessathon-starter and bullet cloned at $HOME/bullet. Three levels up from
+# aire/bullet-trainer/ is $HOME, which is why the path reads the way it does.
+#
+# This crate is never built into anything that ships. It trains weights; the agent loads the
+# weights and evaluates them with our own numba code.
+
+[package]
+name = "chess-bullet-trainer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bullet_lib = { path = "../../../bullet/crates/bullet_lib" }
+
+[features]
+cuda = ["bullet_lib/cuda"]
+rocm = ["bullet_lib/rocm"]
+
+[[bin]]
+name = "chess-bullet-trainer"
+path = "src/main.rs"
