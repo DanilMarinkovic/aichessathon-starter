@@ -28,7 +28,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
-#SBATCH --time=01:30:00
+#SBATCH --time=03:00:00
 #SBATCH --output=aire/logs/bullet-sched-%j.out
 
 set -euo pipefail
@@ -77,7 +77,7 @@ for SB in $SCHEDULES; do
       THREADS="${SLURM_CPUS_PER_TASK:-8}" cargo run --release --features cuda )
 
   CHECKPOINT=$(ls -d aire/bullet-trainer/checkpoints/"$NET_ID"-* | sort -t- -k2 -n | tail -1)
-  KEEP="aire/data/bullet-${NET_ID}.npz"
+  KEEP="aire/data/sched-${NET_ID}.npz"
   uv run python tools/from_bullet.py "$CHECKPOINT/raw.bin" --buckets "$NBUCKETS" --out "$KEEP"
 
   cp "$KEEP" weights/net.npz
@@ -94,4 +94,4 @@ cat "$RESULTS"
 echo
 echo "Held-out loss per superbatch is in this log; the schedule to keep is the one where it"
 echo "stops falling. Measure the best two or three:"
-echo "  sbatch --array=0-4 aire/measure-nets.slurm"
+echo "  PATTERN=sched-\* sbatch --array=0-4 aire/measure-nets.slurm"

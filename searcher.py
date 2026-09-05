@@ -105,11 +105,40 @@ CACHE_VALUES, CACHE_BOARDS = nnue_new_cache()
 
 PIECE_VALUE = np.array([0, 100, 320, 330, 500, 900, 20000], dtype=np.int64)
 
+# History heuristic bounds, using the gravity update every modern engine uses:
+#
+#     history += bonus - history * abs(bonus) / MAX_HISTORY
+#
+# The subtracted term is what makes it work. An entry near the ceiling barely moves, one near
+# zero moves almost the full bonus, so the table saturates smoothly instead of needing a clamp
+# and a periodic halving -- and a cutoff the ordering did not expect teaches it more than one
+# it did. Values are bounded to +/-MAX_HISTORY by construction.
+#
+# Written from the chessprogramming wiki's description rather than invented here. A first
+# attempt using a flat `+= depth * depth` with a manual clamp learns which moves are good and
+# never which are bad, which is a much weaker signal than it looks.
+MAX_HISTORY = 16384
+
 _lmr = np.zeros((64, 64), dtype=np.int64)
 for _depth in range(1, 64):
     for _played in range(1, 64):
         _lmr[_depth, _played] = int(0.75 + np.log(_depth) * np.log(_played) / 2.25)
 LMR = _lmr
+
+# Late move pruning: how many moves to try at a given depth before abandoning the quiet ones.
+#
+# This was measured at -23.2 Elo once already, on a real clock, and reverted. It is back because
+# the reason it failed has changed. LMP is a bet that move ordering is good enough that a quiet
+# move this far down the list is not worth a subtree -- and at the time, ordering was a history
+# table that could only learn which moves were good, never which were bad. The gravity update
+# and its malus fixed that and measured +81.6, so the bet is a different one now.
+#
+# The thresholds are deliberately unchanged from the run that failed. Changing the ordering and
+# the constants together would leave no way to tell which mattered.
+_lmp = np.zeros(16, dtype=np.int64)
+for _depth in range(1, 16):
+    _lmp[_depth] = 3 + _depth * _depth
+LMP = _lmp
 
 
 @njit(int64(int32, int32, int64, int64), nogil=True, cache=False, inline="always")
@@ -498,9 +527,9 @@ def negamax(
                 rank = 700_000
             else:
                 piece = side * 6 + piece_on(states[ply], move_from(move), side) - 1
+                # Bounded to +/-MAX_HISTORY by the gravity update, so quiet moves always sort
+                # below the killers above and the captures scored in score_move.
                 rank = history[piece, move_to(move)]
-                if rank > 600_000:
-                    rank = 600_000
         order[ply, index] = np.int32(rank)
 
     best_score = np.int32(-INFINITY)
@@ -517,6 +546,19 @@ def negamax(
         )
         if make_move(states[ply], move, states[ply + 1]) == 0:
             continue
+        # Checked before the move is made, so the make is saved too. Never in a PV node, never
+        # in check, and never while the best score so far is a mate against us -- those are the
+        # positions where the saving move is exactly the one ordering did not expect.
+        if (
+            not pv_node
+            and checked == 0
+            and depth <= 8
+            and quiet
+            and played >= LMP[depth]
+            and best_score > -MATE_THRESHOLD
+        ):
+            continue
+
         push_accumulator(states, accumulators, cache_values, cache_boards, control, ply)
         path[root_offset + ply + 1] = states[ply + 1, HASH]
         played += 1
@@ -576,12 +618,38 @@ def negamax(
                         if killers[ply, 0] != move:
                             killers[ply, 1] = killers[ply, 0]
                             killers[ply, 0] = move
+                        bonus = 300 * depth - 250
+                        if bonus > MAX_HISTORY:
+                            bonus = MAX_HISTORY
                         piece = side * 6 + piece_on(states[ply], move_from(move), side) - 1
-                        history[piece, move_to(move)] += depth * depth
-                        if history[piece, move_to(move)] > 1_000_000:
-                            for a in range(12):
-                                for b in range(64):
-                                    history[a, b] >>= 1
+                        entry = history[piece, move_to(move)]
+                        history[piece, move_to(move)] = (
+                            entry + bonus - entry * bonus // MAX_HISTORY
+                        )
+
+                        # The same bonus, negated, for the quiet moves tried before this one.
+                        # Rewarding only the winner leaves every loser holding whatever score
+                        # it already had, so the table learns which moves are good and never
+                        # which are bad. pick_move is a selection sort, so the moves already
+                        # tried are exactly moves[ply, 0..index-1], in order; nothing else has
+                        # to be recorded to find them.
+                        for earlier in range(index):
+                            tried = moves[ply, earlier]
+                            if (
+                                move_promotion(tried) == 0
+                                and move_flag(tried) != EN_PASSANT
+                                and piece_on(states[ply], move_to(tried), 1 - side) == 0
+                            ):
+                                loser = (
+                                    side * 6
+                                    + piece_on(states[ply], move_from(tried), side)
+                                    - 1
+                                )
+                                if loser >= 0:
+                                    was = history[loser, move_to(tried)]
+                                    history[loser, move_to(tried)] = (
+                                        was - bonus - was * bonus // MAX_HISTORY
+                                    )
                     break
 
     if played == 0:

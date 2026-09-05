@@ -50,12 +50,15 @@ PAIRS=${PAIRS:-300}
 TIME_CONTROL=${TIME_CONTROL:-120000,500}
 RESULTS="$ORIGIN/aire/data/net-results.txt"
 
-# Sorted so the array index means the same thing on every task.
-mapfile -t CANDIDATES < <(ls "$ORIGIN"/aire/data/bullet-*.npz 2>/dev/null | sort)
+# Sorted so the array index means the same thing on every task. PATTERN selects one sweep's
+# output: the data directory accumulates networks from every sweep ever run, and measuring a
+# stale one wastes an hour of node time and puts a misleading row in the results file.
+PATTERN=${PATTERN:-bullet-*}
+mapfile -t CANDIDATES < <(ls "$ORIGIN"/aire/data/${PATTERN}.npz 2>/dev/null | sort -V)
 TASK=${SLURM_ARRAY_TASK_ID:-0}
 
 if [ "${#CANDIDATES[@]}" -eq 0 ]; then
-  echo "ERROR: no aire/data/bullet-*.npz. Run aire/bullet-sweep.slurm first." >&2
+  echo "ERROR: no aire/data/${PATTERN}.npz. Run a sweep first." >&2
   exit 1
 fi
 if [ "$TASK" -ge "${#CANDIDATES[@]}" ]; then

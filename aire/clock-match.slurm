@@ -22,13 +22,21 @@
 #
 # Results are wall-clock, so they are comparable within one machine and not across machines.
 # Do not put a number from here beside a number from the laptop and read a difference into it.
+#
+# On the time limit. A 300-pair match is 600 games of roughly 290 seconds, so the wall clock is
+# 600 * 290 / WORKERS: about 50 minutes at 60 workers, 30 at 100, 20 at 140. The default here
+# covers the slow end with a margin and no more. Asking for four hours because it is easier than
+# working it out is how a job that needs twenty minutes ends up behind everything on the
+# cluster, and backfill cannot help a request it has no gap for. Raise it only when PAIRS or
+# WORKERS actually warrant it -- and note that a job killed at the wall still leaves every
+# progress line in the log, so an overrun costs precision rather than the whole result.
 
 #SBATCH --job-name=clock-match
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=32G
-#SBATCH --time=01:30:00
+#SBATCH --time=00:50:00
 #SBATCH --output=aire/logs/clock-match-%j.out
 
 set -euo pipefail
