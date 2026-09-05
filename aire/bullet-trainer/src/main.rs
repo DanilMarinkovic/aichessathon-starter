@@ -31,7 +31,7 @@ use bullet_lib::{
     trainer::{
         save::SavedFormat,
         schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
-        settings::LocalSettings,
+        settings::{LocalSettings, TestDataset},
     },
     value::{loader, ValueTrainerBuilder},
 };
@@ -99,6 +99,11 @@ fn main() {
         "BUCKETS={buckets} but the layout only names {banks} distinct banks; it saturates at 5"
     );
     let data = env::var("DATA").unwrap_or_else(|_| "aire/data/positions.data".to_string());
+    // A held-out set, built from shards that are not in the training file, so the loss it
+    // reports is generalisation rather than fit. Without it the only signal that a longer
+    // schedule has started to overfit is an hour-long match per configuration, which is the
+    // wrong way round when training itself takes two minutes.
+    let test_data = env::var("TEST_DATA").unwrap_or_default();
     let net_id = env::var("NET_ID").unwrap_or_else(|_| "chess".to_string());
 
     // One superbatch is one pass over the data, so `end_superbatch` is the epoch count and the
@@ -148,7 +153,13 @@ fn main() {
 
     let settings = LocalSettings {
         threads,
-        test_set: None,
+        // Once per superbatch: often enough to see the curve turn, rare enough not to slow
+        // training, which is the whole reason a long schedule is affordable.
+        test_set: if test_data.is_empty() {
+            None
+        } else {
+            Some(TestDataset { path: &test_data, freq: batches_per_superbatch })
+        },
         output_directory: "checkpoints",
         batch_queue_size: 64,
     };
