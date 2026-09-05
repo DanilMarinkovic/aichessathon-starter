@@ -22,9 +22,10 @@ Column-major `HIDDEN x 768` and row-major `(768, HIDDEN)` are the same bytes: 76
 HIDDEN consecutive values, one group per input feature. That is already the layout `nnue.py`
 indexes, so no transpose is involved.
 
-This only handles the plain 768 network, BUCKETS = 1. King buckets would multiply the first
-dimension, and our own sweep measured them as worth nothing, so the bullet path does not carry
-them until something says otherwise.
+King buckets multiply the first dimension: the weight matrix is (768 * BUCKETS, HIDDEN), laid
+out bucket by bucket, which is exactly how nnue.py indexes it via `KING_BUCKET[...] * INPUTS`.
+`--buckets` must match the BUCKETS the bullet run used; the size check below catches a mismatch
+rather than reshaping into a plausible wrong answer.
 """
 
 import argparse
@@ -38,14 +39,18 @@ QA = 255
 QB = 64
 SCALE = 400
 INPUTS = 768
-# 768 weights plus a bias per hidden neuron, two output weights per neuron, one output bias.
-FLOATS_PER_HIDDEN = INPUTS + 1 + 2
+# Per hidden neuron: one weight per input row (768 per bucket), a bias, and two output weights.
+# Plus a single output bias for the whole network.
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert a bullet checkpoint to weights/net.npz")
     parser.add_argument("raw", type=Path, help="path to a checkpoint's raw.bin")
     parser.add_argument("--out", type=Path, default=Path("weights/net.npz"))
+    parser.add_argument(
+        "--buckets", type=int, default=4,
+        help="king buckets the trainer used; must match BUCKETS in the bullet run",
+    )
     arguments = parser.parse_args()
 
     values = np.fromfile(arguments.raw, dtype=np.float32)
@@ -53,16 +58,19 @@ def main() -> None:
     # The layout is fully determined by one unknown, so the file size has to agree with a whole
     # number of hidden neurons. If it does not, the tensor order or the architecture differs
     # from what this expects and going further would write a plausible but wrong network.
-    if (len(values) - 1) % FLOATS_PER_HIDDEN != 0:
+    per_hidden = INPUTS * arguments.buckets + 3
+    if (len(values) - 1) % per_hidden != 0:
         raise SystemExit(
-            f"{arguments.raw} holds {len(values):,} floats, which is not 771*HIDDEN + 1. "
-            "The trainer's save_format or architecture does not match this converter."
+            f"{arguments.raw} holds {len(values):,} floats, which is not "
+            f"{per_hidden}*HIDDEN + 1 for {arguments.buckets} buckets. Either --buckets does "
+            "not match the BUCKETS the trainer used, or save_format has changed."
         )
-    hidden = (len(values) - 1) // FLOATS_PER_HIDDEN
+    hidden = (len(values) - 1) // per_hidden
+    rows = INPUTS * arguments.buckets
 
     at = 0
-    weights = values[at : at + INPUTS * hidden].reshape(INPUTS, hidden)
-    at += INPUTS * hidden
+    weights = values[at : at + rows * hidden].reshape(rows, hidden)
+    at += rows * hidden
     biases = values[at : at + hidden]
     at += hidden
     output = values[at : at + 2 * hidden]
@@ -87,13 +95,13 @@ def main() -> None:
         output=quantised_output,
         output_bias=np.int32(round(output_bias * QA * QB)),
         hidden=np.int32(hidden),
-        buckets=np.int32(1),
+        buckets=np.int32(arguments.buckets),
         qa=np.int32(QA),
         qb=np.int32(QB),
         scale=np.int32(SCALE),
     )
     print(
-        f"wrote {arguments.out}: {hidden} hidden, 1 bucket, "
+        f"wrote {arguments.out}: {hidden} hidden, {arguments.buckets} buckets, "
         f"{arguments.out.stat().st_size / 1e6:.1f} MB"
     )
     print("check it with: uv run python tests/check_nnue.py")

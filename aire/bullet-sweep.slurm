@@ -58,7 +58,10 @@ SCREEN=${SCREEN:-aire/data/shard-1.epd}
 
 # hidden superbatches. 128/8 is the network that lost, kept as the control: if the rest of the
 # sweep does not beat it here, the problem is not capacity and this whole theory is wrong.
-CONFIGS=("128 8" "128 40" "256 40" "384 40" "512 40" "512 80" "768 40")
+# hidden buckets superbatches. Buckets max out at 5: nnue.py's _king_buckets names corner and
+# centre on ranks 1-2, the same on 3-4, and one bank for everything beyond, so a sixth is a
+# bank no king square ever selects and bullet rejects the shape.
+CONFIGS=("128 4 40" "128 5 40" "256 4 40" "192 4 40" "128 4 80" "256 5 40" "128 1 40")
 
 if [ ! -s "$EPD" ]; then
   echo "ERROR: $EPD missing. cat aire/data/shard-*.epd > $EPD" >&2
@@ -87,19 +90,19 @@ trap restore EXIT
 
 : > "$RESULTS"
 for config in "${CONFIGS[@]}"; do
-  read -r HIDDEN SUPERBATCHES <<< "$config"
-  NET_ID="h${HIDDEN}sb${SUPERBATCHES}"
+  read -r HIDDEN NBUCKETS SUPERBATCHES <<< "$config"
+  NET_ID="h${HIDDEN}b${NBUCKETS}sb${SUPERBATCHES}"
   echo
   echo "=============== $NET_ID ==============="
 
   ( cd aire/bullet-trainer
-    HIDDEN="$HIDDEN" EPOCHS="$SUPERBATCHES" POSITIONS="$POSITIONS" \
+    HIDDEN="$HIDDEN" BUCKETS="$NBUCKETS" EPOCHS="$SUPERBATCHES" POSITIONS="$POSITIONS" \
       NET_ID="$NET_ID" DATA="$ORIGIN/$BINARY" THREADS="${SLURM_CPUS_PER_TASK:-8}" \
       cargo run --release --features cuda )
 
   CHECKPOINT=$(ls -d aire/bullet-trainer/checkpoints/"$NET_ID"-* | sort -t- -k2 -n | tail -1)
   KEEP="aire/data/bullet-${NET_ID}.npz"
-  uv run python tools/from_bullet.py "$CHECKPOINT/raw.bin" --out "$KEEP"
+  uv run python tools/from_bullet.py "$CHECKPOINT/raw.bin" --buckets "$NBUCKETS" --out "$KEEP"
 
   # Screen it. The engine loads weights/net.npz and nothing else, so the candidate has to be
   # installed there to be evaluated at all; it is replaced on every iteration and the last one
@@ -107,9 +110,9 @@ for config in "${CONFIGS[@]}"; do
   cp "$KEEP" weights/net.npz
   SUMMARY=$(uv run python tools/side_bias.py "$SCREEN" --limit 4000 | tail -3)
   echo "$SUMMARY"
-  CORRELATION=$(echo "$SUMMARY" | awk '/^  all/ {print $6}')
-  printf "%-10s hidden=%-4s superbatches=%-3s correlation=%s\n" \
-    "$NET_ID" "$HIDDEN" "$SUPERBATCHES" "${CORRELATION:-?}" >> "$RESULTS"
+  CORRELATION=$(echo "$SUMMARY" | awk '/^  all/ {print $7}')
+  printf "%-14s hidden=%-4s buckets=%-2s superbatches=%-3s correlation=%s\n" \
+    "$NET_ID" "$HIDDEN" "$NBUCKETS" "$SUPERBATCHES" "${CORRELATION:-?}" >> "$RESULTS"
 done
 
 echo

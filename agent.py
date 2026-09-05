@@ -47,11 +47,22 @@ _increment_ms = -1.0
 _last_left = -1
 _last_spent = 0.0
 
-# Zobrist keys of the positions we have been asked to move in, in order. The platform sends a
-# FEN and nothing else, so this is the only record of the game there is. Only our own turns
-# appear here, which is why they are written to PATH two apart: a repetition scan steps back
-# in twos, and positions two plies apart are the ones that can actually repeat.
+# Zobrist keys of the game so far. The platform sends a FEN and nothing else, so this is the
+# only record of the game there is, and it has to carry both parities.
+#
+# `_history` holds the positions we were asked to move in, at even offsets in PATH. `_after`
+# holds the position each of our chosen moves produced, at the odd offsets between them. A
+# repetition scan steps back in twos to stay on one side to move, so with only the even slots
+# filled it walks along a row of zeros whenever it starts from an odd ply -- which is every
+# position that arises immediately after our own move.
+#
+# That blind spot cost three drawn games. In two of them the engine was winning by five pawns
+# and repeated a position it had itself created two moves earlier, because the position it was
+# repeating was one where the opponent was to move, and nothing in this record mentioned it.
+# We never see the opponent's turn, but we do choose our own move, so the position it leads to
+# is knowable and belongs here.
 _history: list[int] = []
+_after: list[int] = []
 
 _fallback_values = {
     chess.PAWN: 100,
@@ -64,11 +75,21 @@ _fallback_values = {
 
 
 def _budget_ms(time_left_ms: int) -> float:
-    """How long to think. A flag is a loss, so this is deliberately conservative.
+    """How long to think. A flag is a loss, so this stays conservative.
 
     Dividing the remaining clock rather than spending a constant makes the allocation decay
     on its own: whatever happens, the next move gets a fraction of what is left, and the
     increment keeps that fraction from collapsing.
+
+    The divisor is probably too cautious. The platform's records for seventeen rated games show
+    78% of the available time used, one game ending with 76.8 seconds unspent, and -- because
+    the allocation only ever decays -- a slowest move of exactly 4.8 seconds in every game, the
+    opening allocation. The engine can never think harder about a critical middlegame position
+    than about its first move out of book. Replaying the formula over those real game lengths,
+    a divisor of 18 would spend 90% and still leave 4.4 seconds in the worst case.
+
+    It stays at 26 until that is measured. More thinking time is not automatically more Elo:
+    on the position that lost round 14, twenty times the search picked the same losing move.
     """
     usable = max(1.0, time_left_ms - OVERHEAD_MS)
     increment = max(0.0, _increment_ms)
@@ -87,16 +108,45 @@ def _observe_clock(time_left_ms: int) -> None:
 
 
 def _record(key: int) -> int:
-    """Append a position and return its index in PATH."""
+    """Append a position we are to move in, and return its index in PATH."""
     if not _history or _history[-1] != key:
         _history.append(key)
     if len(_history) > MAX_HISTORY:
-        del _history[: len(_history) - 256]
+        # Drop the same number from both, not down to the same length. `_after` always runs one
+        # entry behind `_history` -- the move for the current position has not been chosen yet
+        # -- so trimming each to 256 would slide them out of step by one, and every repetition
+        # test afterwards would compare a position against the wrong ply. The platform caps a
+        # game at 300 plies and MAX_HISTORY is 968 of our own moves, so this cannot fire in a
+        # rated game; it is right because a silent off-by-one here has no symptom.
+        drop = len(_history) - 256
+        del _history[:drop]
+        del _after[:drop]
     return (len(_history) - 1) * 2
 
 
+def _record_after(board: chess.Board, move: chess.Move) -> None:
+    """Append the position our chosen move produces, so a repetition of it can be seen.
+
+    Trimmed to match `_history`, because the two are indexed in step: entry k of one sits at
+    PATH[2k] and entry k of the other at PATH[2k + 1].
+    """
+    board.push(move)
+    try:
+        key = int(from_board(board)[HASH])
+    finally:
+        board.pop()
+    while len(_after) >= len(_history):
+        _after.pop()
+    _after.append(key)
+
+
 def _fallback(board: chess.Board) -> str:
-    """A legal move for when the engine cannot supply one. Grabs the most valuable piece."""
+    """A legal move for when the engine cannot supply one. Grabs the most valuable piece.
+
+    It still records what it played. `_history` and `_after` are indexed in lockstep, so a ply
+    that goes unrecorded here would put every later entry on the wrong parity and quietly break
+    repetition detection for the rest of the game.
+    """
     best = None
     best_value = -1
     for move in board.legal_moves:
@@ -105,7 +155,10 @@ def _fallback(board: chess.Board) -> str:
         if value > best_value:
             best_value = value
             best = move
-    return best.uci() if best is not None else "0000"
+    if best is None:
+        return "0000"
+    _record_after(board, best)
+    return best.uci()
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
@@ -120,6 +173,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
             return "0000"
         if len(legal) == 1:
             _record(int(from_board(board)[HASH]))
+            _record_after(board, legal[0])
             return legal[0].uci()
         try:
             return _think(board, time_left_ms)
@@ -139,6 +193,8 @@ def _think(board: chess.Board, time_left_ms: int) -> str:
     searcher.PATH[: root_offset + MAX_PLY + 8] = 0
     for index, key in enumerate(_history):
         searcher.PATH[index * 2] = np.uint64(key)
+    for index, key in enumerate(_after):
+        searcher.PATH[index * 2 + 1] = np.uint64(key)
 
     if FIXED_NODES > 0:
         # The timer stays as a hang guard only; with a sane clock the node limit binds first.
@@ -174,6 +230,8 @@ def _think(board: chess.Board, time_left_ms: int) -> str:
     if move is None:
         print(f"engine returned {uci!r}, which is not legal here; falling back")
         return _fallback(board)
+
+    _record_after(board, move)
 
     nodes = int(searcher.CONTROL[NODES])
     print(

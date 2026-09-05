@@ -261,6 +261,17 @@ def main() -> None:
         if fens:
             jobs.append((fens, arguments.nodes, arguments.seed + worker, arguments.random_plies))
 
+    # Which evaluation is about to play, recorded in the log rather than inferred later. The
+    # positions a dataset contains depend entirely on the strength of the engine that generated
+    # them, and once the shards are written nothing in them says which it was. Reconstructing it
+    # afterwards from job timestamps is guesswork, and guessing wrong means training on data you
+    # believe is stronger than it is.
+    import nnue  # deliberately local: importing it loads and compiles the network
+    print(
+        f"shard {arguments.shard}: self-play uses the "
+        f"{'trained network' if nnue.TRAINED else 'HAND-WRITTEN evaluation'}",
+        flush=True,
+    )
     print(f"shard {arguments.shard}: playing {arguments.games} games...", flush=True)
     with ProcessPoolExecutor(arguments.workers) as pool:
         played = [game for batch in pool.map(_play_batch, jobs) for game in batch]
