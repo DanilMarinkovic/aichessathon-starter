@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 import nnue
-from position import SIDE, from_board
+from position import OCC_ALL, SIDE, from_board
 from tools.train import MAX_FEATURES, Network
 
 
@@ -33,7 +33,9 @@ def engine_scores(fens: list[str]) -> np.ndarray:
     for index, fen in enumerate(fens):
         state = np.ascontiguousarray(from_board(chess.Board(fen)))
         nnue.refresh(state, accumulator, values, boards)
-        out[index] = float(nnue.forward(accumulator, int(state[SIDE])))
+        out[index] = float(
+            nnue.forward(accumulator, int(state[SIDE]), nnue.output_bucket(state[OCC_ALL]))
+        )
     # The engine deliberately reports in calibrated units rather than the units it trained
     # through, so undo that before comparing against the model. Without this the check reads a
     # correctly quantised network as a scaling error, which is exactly the alarm it exists to

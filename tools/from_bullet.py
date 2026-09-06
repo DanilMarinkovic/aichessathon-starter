@@ -15,8 +15,13 @@ with it:
 
     l0w   768 x HIDDEN   feature weights, column-major, so (768, HIDDEN) row-major here
     l0b   HIDDEN         feature bias
-    l1w   2 x HIDDEN     output weights, side to move first, then the opponent
-    l1b   1              output bias
+    l1w   OB x 2 x HIDDEN  output weights, one bank per output bucket, and within a bank the
+                           side to move's half first, then the opponent's
+    l1b   OB               one output bias per bucket
+
+The trainer saves l1w transposed, so a bank's 2 x HIDDEN weights are contiguous and nnue.py
+can take a row. With one bucket that is the same bytes as before output buckets existed, which
+is what makes OUTPUT_BUCKETS=1 an exact control rather than an approximate one.
 
 Column-major `HIDDEN x 768` and row-major `(768, HIDDEN)` are the same bytes: 768 groups of
 HIDDEN consecutive values, one group per input feature. That is already the layout `nnue.py`
@@ -51,6 +56,10 @@ def main() -> None:
         "--buckets", type=int, default=4,
         help="king buckets the trainer used; must match BUCKETS in the bullet run",
     )
+    parser.add_argument(
+        "--output-buckets", type=int, default=1,
+        help="output buckets the trainer used; must match OUTPUT_BUCKETS in the bullet run",
+    )
     arguments = parser.parse_args()
 
     values = np.fromfile(arguments.raw, dtype=np.float32)
@@ -58,14 +67,16 @@ def main() -> None:
     # The layout is fully determined by one unknown, so the file size has to agree with a whole
     # number of hidden neurons. If it does not, the tensor order or the architecture differs
     # from what this expects and going further would write a plausible but wrong network.
-    per_hidden = INPUTS * arguments.buckets + 3
-    if (len(values) - 1) % per_hidden != 0:
+    output_buckets = arguments.output_buckets
+    per_hidden = INPUTS * arguments.buckets + 1 + 2 * output_buckets
+    if (len(values) - output_buckets) % per_hidden != 0:
         raise SystemExit(
             f"{arguments.raw} holds {len(values):,} floats, which is not "
-            f"{per_hidden}*HIDDEN + 1 for {arguments.buckets} buckets. Either --buckets does "
-            "not match the BUCKETS the trainer used, or save_format has changed."
+            f"{per_hidden}*HIDDEN + {output_buckets} for {arguments.buckets} king buckets and "
+            f"{output_buckets} output buckets. Either --buckets or --output-buckets does not "
+            "match the trainer, or save_format has changed."
         )
-    hidden = (len(values) - 1) // per_hidden
+    hidden = (len(values) - output_buckets) // per_hidden
     rows = INPUTS * arguments.buckets
 
     at = 0
@@ -73,9 +84,19 @@ def main() -> None:
     at += rows * hidden
     biases = values[at : at + hidden]
     at += hidden
-    output = values[at : at + 2 * hidden]
-    at += 2 * hidden
-    output_bias = float(values[at])
+    # (2*HIDDEN, OB) read row-major, then transposed to give each bucket a contiguous row.
+    # Reading it directly as (OB, 2*HIDDEN) interleaves neurons across buckets: the network
+    # loads, quantises and plays, and evaluates like noise. The screening step caught it at a
+    # correlation of -0.0667 against the labelling engine, where a sound network scores 0.97.
+    # The tell is that adjacent material buckets should hold similar weights -- correlation
+    # 0.71 between bucket 0 and 1 under this reading, -0.11 under the other.
+    output = (
+        values[at : at + output_buckets * 2 * hidden]
+        .reshape(2 * hidden, output_buckets)
+        .T.copy()
+    )
+    at += output_buckets * 2 * hidden
+    output_bias = values[at : at + output_buckets]
 
     quantised_weights = np.round(weights * QA).astype(np.int16)
     quantised_biases = np.round(biases * QA).astype(np.int16)
@@ -93,7 +114,7 @@ def main() -> None:
         weights=quantised_weights,
         biases=quantised_biases,
         output=quantised_output,
-        output_bias=np.int32(round(output_bias * QA * QB)),
+        output_bias=np.round(output_bias * QA * QB).astype(np.int32),
         hidden=np.int32(hidden),
         buckets=np.int32(arguments.buckets),
         qa=np.int32(QA),
@@ -101,8 +122,8 @@ def main() -> None:
         scale=np.int32(SCALE),
     )
     print(
-        f"wrote {arguments.out}: {hidden} hidden, {arguments.buckets} buckets, "
-        f"{arguments.out.stat().st_size / 1e6:.1f} MB"
+        f"wrote {arguments.out}: {hidden} hidden, {arguments.buckets} king buckets, "
+        f"{output_buckets} output buckets, {arguments.out.stat().st_size / 1e6:.1f} MB"
     )
     print("check it with: uv run python tests/check_nnue.py")
 

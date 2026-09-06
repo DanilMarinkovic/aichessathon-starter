@@ -82,6 +82,39 @@ BEST_DEPTH = 5
 # Which evaluation to use. Lives in CONTROL rather than a global because numba freezes a
 # global array into compiled code as a read-only constant and folds the branch away.
 USE_NNUE = 6
+# Static evaluation correction history.
+#
+# The network's evaluation of a position is systematically wrong in ways that repeat: the same
+# kind of pawn structure gets misjudged the same way every time it appears. The search already
+# discovers this -- every node compares what the evaluation said against what searching the
+# position actually returned -- and then throws the comparison away. This keeps it.
+#
+# Written from the chessprogramming wiki's description, following the exponential-moving-average
+# form Alexandria uses rather than Stockfish's gravity form, because the update is one line and
+# the constants are stated. Introduced in Caissa in October 2023 and since adopted widely.
+#
+# Two reasons it suits this engine specifically. It corrects the evaluation, which is where our
+# remaining error is -- the search is 1 for 7 on measured changes. And it is reported to scale
+# up with time control rather than down, which is the opposite of the pruning changes that
+# flattered themselves at shallow depth and lost 23 and 33 Elo on a real clock.
+#
+# Indexed by pawn structure and side, and it lives inside CONTROL rather than as a global.
+# numba compiles a global array into a function as read-only, which is why nnue.py can hold its
+# weights that way and why this cannot: the table has to be written on every node. The
+# alternative is a seventh array threaded through six recursive call sites of otherwise
+# identically typed arrays, which is the edit that goes wrong silently. A signature fixes an
+# array's dtype and dimensionality, not its length, so CONTROL simply gets longer.
+CORR_SIZE = 16384
+CORR_MASK = CORR_SIZE - 1
+# The table stores centipawns multiplied by GRAIN, so a correction accumulates in fractions of
+# a centipawn instead of rounding to nothing. MAX/GRAIN = 64cp is the most it can ever move an
+# evaluation, which keeps a bad entry from rewriting the position's assessment outright.
+CORR_GRAIN = 256
+CORR_MAX = 16384
+CORR_WEIGHT_SCALE = 256
+# Where the correction table starts inside CONTROL. Side 0 occupies CORR_BASE onwards, side 1
+# the CORR_SIZE entries after that.
+CORR_BASE = 16
 
 PATH_LIMIT = 2048
 
@@ -93,7 +126,7 @@ ORDER = np.zeros((MAX_PLY + 8, MAX_MOVES), dtype=np.int32)
 KILLERS = np.zeros((MAX_PLY + 8, 2), dtype=np.int32)
 HISTORY = np.zeros((12, 64), dtype=np.int64)
 PATH = np.zeros(PATH_LIMIT + MAX_PLY + 8, dtype=np.uint64)
-CONTROL = np.zeros(8, dtype=np.int64)
+CONTROL = np.zeros(CORR_BASE + 2 * CORR_SIZE, dtype=np.int64)
 
 # One network accumulator per ply, mirroring how positions are already stacked. numba freezes
 # the array's identity into the compiled code and reads its contents at run time, so the search
@@ -124,21 +157,6 @@ for _depth in range(1, 64):
     for _played in range(1, 64):
         _lmr[_depth, _played] = int(0.75 + np.log(_depth) * np.log(_played) / 2.25)
 LMR = _lmr
-
-# Late move pruning: how many moves to try at a given depth before abandoning the quiet ones.
-#
-# This was measured at -23.2 Elo once already, on a real clock, and reverted. It is back because
-# the reason it failed has changed. LMP is a bet that move ordering is good enough that a quiet
-# move this far down the list is not worth a subtree -- and at the time, ordering was a history
-# table that could only learn which moves were good, never which were bad. The gravity update
-# and its malus fixed that and measured +81.6, so the bet is a different one now.
-#
-# The thresholds are deliberately unchanged from the run that failed. Changing the ordering and
-# the constants together would leave no way to tell which mattered.
-_lmp = np.zeros(16, dtype=np.int64)
-for _depth in range(1, 16):
-    _lmp[_depth] = 3 + _depth * _depth
-LMP = _lmp
 
 
 @njit(int64(int32, int32, int64, int64), nogil=True, cache=False, inline="always")
@@ -180,6 +198,20 @@ def material_draw(state: np.ndarray) -> np.int64:
         state[KNIGHT - 1] | state[BISHOP - 1] | state[6 + KNIGHT - 1] | state[6 + BISHOP - 1]
     )
     return 1 if minors <= 1 else 0
+
+
+@njit(int64(uint64[::1]), nogil=True, cache=False, inline="always")
+def pawn_index(state: np.ndarray) -> np.int64:
+    """A hash of the pawn structure alone.
+
+    Multiplicative rather than Zobrist: a Zobrist pawn key would have to be maintained by every
+    make_move, and this is two multiplies on bitboards the position already holds. The constants
+    are the usual odd 64-bit mixers; only their scattering matters, not their provenance.
+    """
+    mixed = (state[PAWN - 1] * np.uint64(0x9E3779B97F4A7C15)) ^ (
+        state[6 + PAWN - 1] * np.uint64(0xC2B2AE3D27D4EB4F)
+    )
+    return np.int64((mixed >> np.uint64(32)) & np.uint64(CORR_MASK))
 
 
 @njit(int64(uint64[:, ::1], uint64[::1], int64, int64), nogil=True, cache=False)
@@ -271,9 +303,15 @@ def score_position(
     states: np.ndarray, accumulators: np.ndarray, control: np.ndarray, ply: np.int64
 ) -> np.int32:
     """Whichever evaluation is in force. The branch is on a value that never changes mid-search."""
+    side = np.int64(states[ply, SIDE])
     if control[USE_NNUE] != 0:
-        return nnue_forward(accumulators[ply], np.int64(states[ply, SIDE]))
-    return np.int32(evaluate(states[ply]))
+        raw = np.int32(nnue_forward(accumulators[ply], side))
+    else:
+        raw = np.int32(evaluate(states[ply]))
+    # Corrected here rather than at each use, so the futility margins, the null-move test and
+    # quiescence's stand-pat all read the same number.
+    slot_c = CORR_BASE + side * CORR_SIZE + pawn_index(states[ply])
+    return raw + np.int32(control[slot_c] // CORR_GRAIN)
 
 
 @njit(
@@ -544,21 +582,26 @@ def negamax(
             and move_flag(move) != EN_PASSANT
             and piece_on(states[ply], move_to(move), 1 - side) == 0
         )
-        if make_move(states[ply], move, states[ply + 1]) == 0:
-            continue
-        # Checked before the move is made, so the make is saved too. Never in a PV node, never
-        # in check, and never while the best score so far is a mate against us -- those are the
-        # positions where the saving move is exactly the one ordering did not expect.
+        # A capture that loses material is worth searching when the compensation is somewhere
+        # in the subtree, and the deeper the search the likelier that is -- so the bar drops
+        # with depth rather than being a flat cutoff. Quiescence already refuses every losing
+        # capture outright; here, where a whole subtree hangs off the move, the threshold is
+        # deliberately looser. Promotions are exempt for the same reason as in quiescence, and
+        # nothing is skipped until one move has been played, so a node always returns a move.
         if (
             not pv_node
             and checked == 0
             and depth <= 8
-            and quiet
-            and played >= LMP[depth]
+            and played > 0
             and best_score > -MATE_THRESHOLD
+            and not quiet
+            and move_promotion(move) == 0
+            and see_ge(states[ply], move, np.int64(-100) * depth) == 0
         ):
             continue
 
+        if make_move(states[ply], move, states[ply + 1]) == 0:
+            continue
         push_accumulator(states, accumulators, cache_values, cache_boards, control, ply)
         path[root_offset + ply + 1] = states[ply + 1, HASH]
         played += 1
@@ -576,6 +619,20 @@ def negamax(
                 reduction = LMR[min(depth, 63), min(played, 63)]
                 if pv_node and reduction > 0:
                     reduction -= 1
+                # The table already knows which quiet moves have been causing cutoffs, and the
+                # ordering uses it. Using it a second time here says how much to trust the
+                # ordering for this move in particular: a move the table likes keeps more of
+                # its depth, one it dislikes loses more. Divided so a saturated entry is worth
+                # two plies either way, which is the magnitude the engines that do this use.
+                # Written out in both directions because floor division on a negative value
+                # rounds away from zero, which would penalise a history of -1 and not reward
+                # a history of +1.
+                stat = history[side * 6 + piece_on(states[ply], move_from(move), side) - 1,
+                               move_to(move)]
+                if stat > 0:
+                    reduction -= stat // (MAX_HISTORY // 2)
+                else:
+                    reduction += (-stat) // (MAX_HISTORY // 2)
                 if reduction > depth - 2:
                     reduction = depth - 2
                 if reduction < 0:
@@ -669,6 +726,38 @@ def negamax(
             flag = UPPER
         tt_key[slot] = key
         tt_data[slot] = pack(best_move, stored, depth, flag)
+
+    # Record how far off the static evaluation turned out to be, so the next position with this
+    # pawn structure starts from a better number.
+    #
+    # Skipped in three cases, all for the same reason -- the difference would not be the
+    # evaluation's fault. In check there is no static evaluation to be wrong. When the best move
+    # is a capture the gap is the exchange the search resolved, which is what a search is for.
+    # And a mate score is not a quantity this table can average.
+    if (
+        checked == 0
+        and abs(best_score) < MATE_THRESHOLD
+        and (
+            best_move == 0
+            or piece_on(states[ply], move_to(best_move), 1 - side) == 0
+        )
+    ):
+        slot_c = CORR_BASE + side * CORR_SIZE + pawn_index(states[ply])
+        entry_c = control[slot_c]
+        # Deeper searches are more trustworthy, so they move the entry further, up to half its
+        # weight in one update. A shallow node nudges; a deep one nearly replaces.
+        weight = depth * depth + 2 * depth + 1
+        if weight > 128:
+            weight = 128
+        updated = (
+            entry_c * (CORR_WEIGHT_SCALE - weight)
+            + np.int64(best_score - static) * CORR_GRAIN * weight
+        ) // CORR_WEIGHT_SCALE
+        if updated > CORR_MAX:
+            updated = CORR_MAX
+        elif updated < -CORR_MAX:
+            updated = -CORR_MAX
+        control[slot_c] = updated
 
     return best_score
 
@@ -785,5 +874,6 @@ def reset() -> None:
     TT_DATA.fill(0)
     HISTORY.fill(0)
     KILLERS.fill(0)
+    # This clears the correction table too, which now lives in the tail of CONTROL.
     CONTROL.fill(0)
     CONTROL[USE_NNUE] = evaluation

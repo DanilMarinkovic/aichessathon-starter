@@ -21,24 +21,37 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 DATA=aire/data
 HELD_OUT=${HELD_OUT:-8}          # how many shards to reserve for validation
+# Which labelling run to build from, and what to call the result. The defaults reproduce the
+# original behaviour exactly, so an existing set is never renamed out from under the trainer.
+# Set all three together when building a second set: sharing either name with a set already on
+# disk overwrites 3.8GB that took a day of cluster time to produce.
+PREFIX=${PREFIX:-shard}
+TRAIN_OUT=${TRAIN_OUT:-positions}
+TEST_OUT=${TEST_OUT:-test}
 
-mapfile -t SHARDS < <(ls "$DATA"/shard-*.epd | sort -V)
+mapfile -t SHARDS < <(ls "$DATA"/${PREFIX}-*.epd 2>/dev/null | sort -V)
 if [ "${#SHARDS[@]}" -lt $((HELD_OUT * 4)) ]; then
-  echo "ERROR: only ${#SHARDS[@]} shards; not enough to hold $HELD_OUT out." >&2
+  echo "ERROR: only ${#SHARDS[@]} ${PREFIX}-*.epd shards; not enough to hold $HELD_OUT out." >&2
   exit 1
 fi
+for existing in "$DATA/$TRAIN_OUT.data" "$DATA/$TEST_OUT.data"; do
+  if [ -s "$existing" ] && [ "${FORCE:-0}" != "1" ]; then
+    echo "ERROR: $existing already exists. Pass different TRAIN_OUT/TEST_OUT, or FORCE=1." >&2
+    exit 1
+  fi
+done
 
 TEST_SHARDS=("${SHARDS[@]: -$HELD_OUT}")
 TRAIN_SHARDS=("${SHARDS[@]:0:$(( ${#SHARDS[@]} - HELD_OUT ))}")
 echo "${#TRAIN_SHARDS[@]} shards for training, ${#TEST_SHARDS[@]} held out"
 
 echo "combining..."
-cat "${TRAIN_SHARDS[@]}" > "$DATA/positions.epd"
-cat "${TEST_SHARDS[@]}"  > "$DATA/test.epd"
-echo "  train $(wc -l < "$DATA/positions.epd") positions"
-echo "  test  $(wc -l < "$DATA/test.epd") positions"
+cat "${TRAIN_SHARDS[@]}" > "$DATA/$TRAIN_OUT.epd"
+cat "${TEST_SHARDS[@]}"  > "$DATA/$TEST_OUT.epd"
+echo "  train $(wc -l < "$DATA/$TRAIN_OUT.epd") positions"
+echo "  test  $(wc -l < "$DATA/$TEST_OUT.epd") positions"
 
-for name in positions test; do
+for name in "$TRAIN_OUT" "$TEST_OUT"; do
   echo "converting $name..."
   uv run python tools/to_bullet.py "$DATA/$name.epd" "$DATA/$name.txt"
   cargo run --release --manifest-path "$HOME/bullet/crates/utils/Cargo.toml" -- \
@@ -48,5 +61,5 @@ for name in positions test; do
 done
 
 echo
-ls -la "$DATA"/positions.data "$DATA"/test.data
+ls -la "$DATA/$TRAIN_OUT.data" "$DATA/$TEST_OUT.data"
 echo "now: sbatch aire/bullet-schedule.slurm"

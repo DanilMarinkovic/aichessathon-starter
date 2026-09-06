@@ -2,7 +2,7 @@
 //
 // The architecture is (768 -> HIDDEN)x2 -> 1 with dual perspective, which is bullet's own
 // `examples/simple.rs`. We arrived at the same place independently because both follow the
-// same references, so there is no architecture to port -- only three conventions to get right,
+// same references, so there is no architecture to port -- only four conventions to get right,
 // each of which fails silently rather than loudly if it is wrong.
 //
 //  1. Activation. `nnue.py` clamps the accumulator to QA and multiplies. It does not square.
@@ -20,13 +20,19 @@
 //     being fitted. bullet's own example uses 0.75, which is worth measuring afterwards, as
 //     one variable rather than two.
 //
+//  4. Output buckets. `nnue.py` picks its output bank with bullet's own MaterialCount rule,
+//     (popcount(occupied) - 2) / ceil(32 / N), and reads the bank as a contiguous row -- which
+//     is what `.transpose()` on l1w below produces. OUTPUT_BUCKETS=1 is the control: with one
+//     bank MaterialCount always returns zero and the transpose is a no-op on a vector, so the
+//     same code path reproduces a pre-bucket network exactly.
+//
 // Everything else is read from the environment so an architecture sweep is a matter of
 // submitting the same binary with different variables, not recompiling six times.
 
 use std::env;
 
 use bullet_lib::{
-    game::inputs::ChessBucketsMirrored,
+    game::{inputs::ChessBucketsMirrored, outputs::MaterialCount},
     nn::optimiser::AdamW,
     trainer::{
         save::SavedFormat,
@@ -78,6 +84,24 @@ fn king_buckets(count: usize) -> [usize; 32] {
 }
 
 fn main() {
+    // A const generic cannot be read from the environment, so the supported counts are named
+    // here and dispatched to one generic body. Anything else fails now, loudly, rather than
+    // training a network whose shape nothing downstream can read.
+    let output_buckets: usize = env_or("OUTPUT_BUCKETS", 1);
+    match output_buckets {
+        // Not 1. bullet's builder asserts the output bucket type has more than one bucket, so a
+        // one-bank arm cannot be built here at all; the control comes from a network trained
+        // before output buckets existed. Caught here rather than left to panic inside bullet
+        // after the data has already been read.
+        1 => panic!("OUTPUT_BUCKETS=1 is not buildable; bullet requires more than one bucket"),
+        2 => train::<2>(),
+        4 => train::<4>(),
+        8 => train::<8>(),
+        other => panic!("OUTPUT_BUCKETS={other} is not one of 1, 2, 4, 8"),
+    }
+}
+
+fn train<const OUTPUT_BUCKETS: usize>() {
     let hidden: usize = env_or("HIDDEN", 128);
     let batch_size: usize = env_or("BATCH", 16_384);
     let positions: usize = env_or("POSITIONS", 50_000_000);
@@ -114,24 +138,28 @@ fn main() {
         .dual_perspective()
         .optimiser(AdamW)
         .inputs(ChessBucketsMirrored::new(table))
+        .output_buckets(MaterialCount::<OUTPUT_BUCKETS>)
         // The order here is the order the weights land in raw.bin, and tools/from_bullet.py
         // reads them back in exactly this order. Changing one without the other writes a
         // network that loads cleanly and plays like noise.
         .save_format(&[
             SavedFormat::id("l0w").round().quantise::<i16>(QA),
             SavedFormat::id("l0b").round().quantise::<i16>(QA),
-            SavedFormat::id("l1w").round().quantise::<i16>(QB),
+            // Transposed so each bucket's 2 x HIDDEN weights are contiguous, which is the
+            // row nnue.py's forward pass takes once per evaluation. On one bucket this is a
+            // no-op over the same bytes.
+            SavedFormat::id("l1w").round().quantise::<i16>(QB).transpose(),
             SavedFormat::id("l1b").round().quantise::<i16>(QA * QB),
         ])
         .loss_fn(|output, target| output.sigmoid().squared_error(target))
-        .build(|builder, stm_inputs, ntm_inputs| {
+        .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             let l0 = builder.new_affine("l0", 768 * buckets, hidden);
-            let l1 = builder.new_affine("l1", 2 * hidden, 1);
+            let l1 = builder.new_affine("l1", 2 * hidden, OUTPUT_BUCKETS);
 
             // crelu, deliberately. See note 1 above.
             let stm_hidden = l0.forward(stm_inputs).crelu();
             let ntm_hidden = l0.forward(ntm_inputs).crelu();
-            l1.forward(stm_hidden.concat(ntm_hidden))
+            l1.forward(stm_hidden.concat(ntm_hidden)).select(output_buckets)
         });
 
     let schedule = TrainingSchedule {
@@ -166,7 +194,7 @@ fn main() {
 
     let data_loader = loader::DirectSequentialDataLoader::new(&[data.as_str()]);
 
-    println!("hidden {hidden}, {buckets} buckets, {epochs} superbatches of {batches_per_superbatch} x {batch_size}");
+    println!("hidden {hidden}, {buckets} king buckets, {OUTPUT_BUCKETS} output buckets, {epochs} superbatches of {batches_per_superbatch} x {batch_size}");
     println!("data {data}, wdl {wdl_weight}, lr {lr_start}, threads {threads}");
 
     trainer.run(&schedule, &settings, &data_loader);

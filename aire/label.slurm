@@ -38,6 +38,12 @@ export MKL_NUM_THREADS=1
 export NUMBA_NUM_THREADS=1
 
 SHARD=${SLURM_ARRAY_TASK_ID:-0}
+# What to name the shards. Labelling runs that differ in anything the network can see -- the
+# reference depth above all -- must not share a prefix, because aire/build-data.sh gathers by
+# glob and would combine them into one training set without saying so. A mixed set is the worst
+# case here: it trains and screens perfectly well and simply answers a different question than
+# the one asked.
+PREFIX=${PREFIX:-shard}
 # Games are played in-process, so a worker pays the engine's eleven second compile once and
 # then plays every game in its batch. That makes the game count per shard worth pushing high:
 # at 400 games over 120 workers each worker plays three, and most of the job is compiling.
@@ -52,7 +58,7 @@ SEED=${SEED:-$((SHARD * 1000 + 1))}
 # positions they produce are ones the network still has to evaluate.
 RANDOM_PLIES=${RANDOM_PLIES:-4}
 
-echo "shard $SHARD on $(hostname), $(nproc) cores"
+echo "shard $PREFIX-$SHARD on $(hostname), $(nproc) cores, reference depth $DEPTH"
 
 # Fail here, loudly, rather than an hour later inside the labelling phase. The binary was
 # built on the login node; this is the first time it runs on the hardware that matters.
@@ -77,4 +83,4 @@ uv run python tools/label.py \
   --depth "$DEPTH" \
   --seed "$SEED" \
   --random-plies "$RANDOM_PLIES" \
-  --out "aire/data/shard-${SHARD}.epd"
+  --out "aire/data/${PREFIX}-${SHARD}.epd"
