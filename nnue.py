@@ -22,16 +22,35 @@ It is worth much less here than it is there: the refresh table took a node from 
 930ns. Not because the updates are slow. numba vectorises them properly, and the inner loop of
 _apply compiles to vpaddw on ymm registers, sixteen int16 lanes at a time.
 
-What governs the cost is cache residency. Every feature update reads one row of WEIGHTS, so the
-matrix wants to fit in L2:
+Shape costs nothing here, over any range we would plausibly ship. tools/nodecost.py runs a real
+search at a fixed node count on one core of a cluster node and reports:
 
-    BUCKETS x 768 x HIDDEN x 2 bytes  <=  about 1 MB
+    banks  hidden    matrix   first-layer weights   ns a node
+        4     128     768KB                  393k         401
+       32      32     1.5MB                  786k         369
+        4     512     3.0MB                 1573k         388
+       32     128     6.0MB                 3146k         370
+       32     256    12.0MB                 6291k         392
 
-At HIDDEN 256 with four buckets that is 1.5MB, it spills to L3, and a node costs 930ns. At
-HIDDEN 128 with four buckets it is 768KB, it fits, and the same parameter count costs 484ns.
-Hence this shape. It also means the bucket layout is free to be chosen for what the network can
-learn: a layout a castled king almost never leaves measured the same as one it crosses
-constantly, because crossings were never the expense.
+Sixteen times the parameters, no cost. The reason is that the matrix is never the working set.
+A feature update reads one row, HIDDEN int16s; within a search the king barely moves, so one or
+two banks per perspective are ever selected, and inside a bank only the rows for pieces actually
+on the board are touched. That hot set is about sixteen kilobytes and stays in L1 whether the
+matrix behind it is 768KB or 12MB. A node is roughly a thousand cycles and the accumulator work
+is a few dozen vector operations of it, so widening the layer moves a small percentage.
+
+This note used to say the opposite: that BUCKETS x 768 x HIDDEN x 2 bytes had to stay inside L2
+or the network "spills", and that 256 hidden therefore costs 930ns a node against 484ns at 128.
+Those two numbers are from different experiments -- 484ns was this network against the 367ns
+hand-crafted evaluation it replaced, and 930ns against 936ns was the accumulator refresh table.
+Neither was ever a measurement of hidden width. Spliced into one sentence they froze the
+architecture at 393k parameters, which is one to two orders of magnitude below a normal NNUE,
+and that is the largest structural gap this engine has. Quote nodecost.py, not this paragraph,
+and re-measure before believing any shape is unaffordable.
+
+The bucket layout is still free to be chosen for what the network can learn: a layout a castled
+king almost never leaves measured the same as one it crosses constantly, because crossings were
+never the expense either.
 
 Every figure quoted here is nodes per second from a real search. Timing these functions by
 calling them from Python does not work: the dispatch alone costs about 230ns, which swamps a
@@ -53,7 +72,7 @@ from pathlib import Path
 import numpy as np
 from numba import int16, int32, int64, njit, types, uint64
 
-from bitboards import KING, U0, U1, lsb
+from bitboards import KING, U0, U1, lsb, popcount
 
 INPUTS = 768
 
@@ -80,8 +99,16 @@ def _load() -> dict[str, object]:
             int(stored["scale"]),
             "weights": np.ascontiguousarray(stored["weights"].astype(np.int16)),
             "biases": np.ascontiguousarray(stored["biases"].astype(np.int16)),
-            "output": np.ascontiguousarray(stored["output"].astype(np.int16)),
-            "output_bias": np.int32(stored["output_bias"]),
+            # A network trained before output buckets existed stores one output vector and a
+            # scalar bias. Reshaping both to a leading axis of one makes it a one-bucket
+            # network, which is the same arithmetic through the same code path -- so the
+            # networks already measured keep evaluating exactly as they did.
+            "output": np.ascontiguousarray(
+                np.atleast_2d(stored["output"].astype(np.int16))
+            ),
+            "output_bias": np.ascontiguousarray(
+                np.atleast_1d(stored["output_bias"]).astype(np.int32)
+            ),
             "trained": True,
         }
     # No network yet. Random weights of the right shape, so every path still compiles and can
@@ -100,8 +127,10 @@ def _load() -> dict[str, object]:
             rng.integers(-32, 32, size=(buckets * INPUTS, hidden)).astype(np.int16)
         ),
         "biases": np.ascontiguousarray(rng.integers(-32, 32, size=hidden).astype(np.int16)),
-        "output": np.ascontiguousarray(rng.integers(-32, 32, size=2 * hidden).astype(np.int16)),
-        "output_bias": np.int32(0),
+        "output": np.ascontiguousarray(
+            rng.integers(-32, 32, size=(1, 2 * hidden)).astype(np.int16)
+        ),
+        "output_bias": np.zeros(1, dtype=np.int32),
         "trained": False,
     }
 
@@ -149,11 +178,24 @@ def _king_buckets(count: int) -> np.ndarray:
 
     Chosen for what the network can learn, not for how rarely a king crosses a boundary.
     Measurement showed crossing frequency does not matter here: a rank-only layout, which a
-    castled king almost never leaves, cost 930ns a node against 936ns for this one. What
-    matters is the size of the weight matrix, which has to stay inside L2.
+    castled king almost never leaves, measured within 6ns a node of this one. Nor does bank
+    count: 32 banks measured the same as 4. See the note at the top.
     """
     table = np.zeros(64, dtype=np.int64)
     if count == 1:
+        return table
+    if count == 32:
+        # One bank per king square over the mirrored half, which makes the feature set
+        # (king square, piece, square) rather than (coarse king region, piece, square). This
+        # is the layout Stockfish and every HalfKP descendant use, and the one that lets the
+        # network say "these pieces are aimed at *that* king" at all.
+        #
+        # Must match `king_buckets` in aire/bullet-trainer/src/main.rs, which indexes its
+        # 32-entry table as rank * 4 + file over the same mirrored half. A layout that differs
+        # between trainer and engine loads cleanly and plays like noise.
+        for square in range(64):
+            rank, file = divmod(square, 8)
+            table[square] = rank * 4 + min(file, 3)
         return table
     for square in range(64):
         rank, file = divmod(square, 8)
@@ -174,6 +216,35 @@ WEIGHTS = _NET["weights"]
 BIASES = _NET["biases"]
 OUTPUT = _NET["output"]
 OUTPUT_BIAS = _NET["output_bias"]
+
+# Output buckets: one output layer per material count, chosen by how many pieces are left.
+#
+# This is capacity the accumulator does not pay for at all. What a feature update costs is one
+# row of WEIGHTS, HIDDEN int16s, and these weights are not in that matrix: eight buckets add
+# 2 x HIDDEN x 8 x 2 bytes, four kilobytes, read once per evaluation rather than once per
+# feature. Width is a real trade against nodes per second; this is not.
+#
+# The bucket must be the one the trainer used, which is bullet's MaterialCount<N>:
+#
+#     bucket = (popcount(occupied) - 2) / ceil(32 / N)
+#
+# Integer division, and the -2 is the two kings, which are always on the board. Disagreeing
+# with the trainer here selects a bank that was fitted for a different phase: it loads
+# cleanly and plays worse, which is why tools/side_bias.py screens correlation afterwards.
+OUT_BUCKETS = int(OUTPUT.shape[0])
+OUT_DIVISOR = -(-32 // OUT_BUCKETS)
+
+
+@njit(int64(uint64), nogil=True, cache=False, inline="always")
+def output_bucket(occupied: np.uint64) -> np.int64:
+    """Which output bank this position selects. Clamped, because a position reached by a
+    promotion the trainer never saw must not index past the end of the array."""
+    bucket = (popcount(occupied) - 2) // OUT_DIVISOR
+    if bucket < 0:
+        return np.int64(0)
+    if bucket >= OUT_BUCKETS:
+        return np.int64(OUT_BUCKETS - 1)
+    return np.int64(bucket)
 
 
 @njit(types.UniTuple(int64, 2)(int64, int64), nogil=True, cache=False, inline="always")
@@ -308,14 +379,36 @@ def advance(
     white_moved_bucket = was_white != now_white
     black_moved_bucket = was_black != now_black
 
+    # One pass over each perspective, not one per changed feature.
+    #
+    # The obvious way to write this is a copy followed by a call per feature, each adding or
+    # subtracting a weight row. That reads and writes the whole accumulator once per feature:
+    # six passes for an ordinary quiet move, eight for a capture. Strong engines do it in one --
+    # the accumulator is held in vector registers while every added and removed row is applied,
+    # and Stockfish's own note that "going past 256 neurons requires multiple passes over the
+    # feature indices as AVX2 doesn't have enough registers" is a statement about exactly this
+    # loop. numba has no register control, but the shape carries over: gather the indices first,
+    # then write each output element once from the source and the rows that touch it.
+    #
+    # It matters most at width. Measured per advance() call, the old form cost 82ns at 128
+    # hidden and 489ns at 256 -- seven times the cost for twice the arithmetic, because the
+    # per-feature loop stops being vectorised somewhere past 160.
+    #
+    # A legal move changes at most two features per perspective on the way in and two on the
+    # way out: castling moves king and rook, a capture-promotion removes the pawn and the
+    # captured piece and adds the promoted one. Anything outside that falls back to the general
+    # path below, which is correct for any number of changes and simply slower.
     for side in range(2):
-        for j in range(HIDDEN):
-            destination[side, j] = source[side, j]
+        if (white_moved_bucket if side == 0 else black_moved_bucket):
+            continue
+        offset, mirror = now_white if side == 0 else now_black
 
-    # Only the perspectives whose indices are still valid can be carried forward by delta.
-    if not (white_moved_bucket and black_moved_bucket):
-        white_offset, white_mirror = now_white
-        black_offset, black_mirror = now_black
+        added = 0
+        removed = 0
+        add0 = np.int64(0)
+        add1 = np.int64(0)
+        sub0 = np.int64(0)
+        sub1 = np.int64(0)
         for piece in range(12):
             changed = before[piece] ^ after[piece]
             if changed == U0:
@@ -324,18 +417,62 @@ def advance(
             while gone != U0:
                 square = lsb(gone)
                 gone &= gone - U1
-                if not white_moved_bucket:
-                    _apply(destination, 0, _index(0, piece, square, white_offset, white_mirror), -1)
-                if not black_moved_bucket:
-                    _apply(destination, 1, _index(1, piece, square, black_offset, black_mirror), -1)
+                index = _index(side, piece, square, offset, mirror)
+                if removed == 0:
+                    sub0 = index
+                elif removed == 1:
+                    sub1 = index
+                removed += 1
             arrived = changed & after[piece]
             while arrived != U0:
                 square = lsb(arrived)
                 arrived &= arrived - U1
-                if not white_moved_bucket:
-                    _apply(destination, 0, _index(0, piece, square, white_offset, white_mirror), 1)
-                if not black_moved_bucket:
-                    _apply(destination, 1, _index(1, piece, square, black_offset, black_mirror), 1)
+                index = _index(side, piece, square, offset, mirror)
+                if added == 0:
+                    add0 = index
+                elif added == 1:
+                    add1 = index
+                added += 1
+
+        if added == 1 and removed == 1:
+            plus = WEIGHTS[add0]
+            minus = WEIGHTS[sub0]
+            for j in range(HIDDEN):
+                destination[side, j] = source[side, j] + plus[j] - minus[j]
+        elif added == 1 and removed == 2:
+            plus = WEIGHTS[add0]
+            minus = WEIGHTS[sub0]
+            minus_two = WEIGHTS[sub1]
+            for j in range(HIDDEN):
+                destination[side, j] = source[side, j] + plus[j] - minus[j] - minus_two[j]
+        elif added == 2 and removed == 2:
+            plus = WEIGHTS[add0]
+            plus_two = WEIGHTS[add1]
+            minus = WEIGHTS[sub0]
+            minus_two = WEIGHTS[sub1]
+            for j in range(HIDDEN):
+                destination[side, j] = (
+                    source[side, j] + plus[j] + plus_two[j] - minus[j] - minus_two[j]
+                )
+        else:
+            # More changes than the specialised forms cover, or none at all. Correct for any
+            # move; it just costs a pass per feature the way the whole function used to.
+            for j in range(HIDDEN):
+                destination[side, j] = source[side, j]
+            for piece in range(12):
+                changed = before[piece] ^ after[piece]
+                if changed == U0:
+                    continue
+                gone = changed & before[piece]
+                while gone != U0:
+                    square = lsb(gone)
+                    gone &= gone - U1
+                    _apply(destination, side, _index(side, piece, square, offset, mirror), -1)
+                arrived = changed & after[piece]
+                while arrived != U0:
+                    square = lsb(arrived)
+                    arrived &= arrived - U1
+                    _apply(destination, side, _index(side, piece, square, offset, mirror), 1)
 
     if white_moved_bucket:
         refresh_side(after, destination, 0, now_white[0], now_white[1], cache_values, cache_boards)
@@ -344,8 +481,8 @@ def advance(
     return 0
 
 
-@njit(int32(int16[:, ::1], int64), nogil=True, cache=False)
-def forward(accumulator: np.ndarray, side_to_move: np.int64) -> np.int32:
+@njit(int32(int16[:, ::1], int64, int64), nogil=True, cache=False)
+def forward(accumulator: np.ndarray, side_to_move: np.int64, bucket: np.int64) -> np.int32:
     """Clipped ReLU and the output dot product in one pass, in centipawns.
 
     The hidden vector is never materialised: clipping and multiplying happen together, and four
@@ -355,6 +492,9 @@ def forward(accumulator: np.ndarray, side_to_move: np.int64) -> np.int32:
     second = np.int32(0)
     third = np.int32(0)
     fourth = np.int32(0)
+    # Taken as a row once rather than indexed two-dimensionally in the inner loop, so the
+    # bucket costs one address computation for the whole evaluation instead of one per neuron.
+    weights = OUTPUT[bucket]
     for half in range(2):
         side = side_to_move if half == 0 else 1 - side_to_move
         base = half * HIDDEN
@@ -379,11 +519,11 @@ def forward(accumulator: np.ndarray, side_to_move: np.int64) -> np.int32:
                 d = 0
             elif d > QA:
                 d = QA
-            first += np.int32(a) * np.int32(OUTPUT[base + j])
-            second += np.int32(b) * np.int32(OUTPUT[base + j + 1])
-            third += np.int32(c) * np.int32(OUTPUT[base + j + 2])
-            fourth += np.int32(d) * np.int32(OUTPUT[base + j + 3])
-    total = first + second + third + fourth + OUTPUT_BIAS
+            first += np.int32(a) * np.int32(weights[base + j])
+            second += np.int32(b) * np.int32(weights[base + j + 1])
+            third += np.int32(c) * np.int32(weights[base + j + 2])
+            fourth += np.int32(d) * np.int32(weights[base + j + 3])
+    total = first + second + third + fourth + OUTPUT_BIAS[bucket]
     return np.int32(total * EVAL_SCALE // (QA * QB))
 
 

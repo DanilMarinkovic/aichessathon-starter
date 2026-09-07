@@ -108,6 +108,15 @@ def main() -> None:
     if saturated:
         print(f"warning: {saturated} weights saturated int16 during quantisation")
 
+    # How far training actually got, taken from the checkpoint directory bullet named
+    # `<net_id>-<superbatch>`. It travels with the weights because the alternative is reading it
+    # off a training log that lives in a different file, on a different machine, for a job that
+    # may have been killed at its wall limit. A network that trained 47 of 380 superbatches and
+    # one that trained all 380 are indistinguishable once they are both an .npz, and the second
+    # thing anyone does with an .npz is play a two hour match and write down the Elo.
+    trained = arguments.raw.resolve().parent.name.rsplit("-", 1)[-1]
+    superbatches = int(trained) if trained.isdigit() else 0
+
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         arguments.out,
@@ -120,11 +129,13 @@ def main() -> None:
         qa=np.int32(QA),
         qb=np.int32(QB),
         scale=np.int32(SCALE),
+        superbatches=np.int32(superbatches),
     )
     print(
         f"wrote {arguments.out}: {hidden} hidden, {arguments.buckets} king buckets, "
         f"{output_buckets} output buckets, {arguments.out.stat().st_size / 1e6:.1f} MB"
     )
+    print(f"  trained for {superbatches} superbatches (from {arguments.raw.parent.name})")
     print("check it with: uv run python tests/check_nnue.py")
 
 

@@ -37,7 +37,7 @@ use bullet_lib::{
     trainer::{
         save::SavedFormat,
         schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
-        settings::{LocalSettings, TestDataset},
+        settings::LocalSettings,
     },
     value::{loader, ValueTrainerBuilder},
 };
@@ -65,6 +65,15 @@ fn env_or<T: std::str::FromStr>(name: &str, fallback: T) -> T {
 fn king_buckets(count: usize) -> [usize; 32] {
     let mut table = [0usize; 32];
     if count == 1 {
+        return table;
+    }
+    if count == 32 {
+        // One bank per king square: full resolution over the mirrored half, which makes the
+        // features (king square, piece, square). Must match nnue.py's `_king_buckets`, where
+        // the same case is `rank * 4 + min(file, 3)` over the already-mirrored square.
+        for (index, slot) in table.iter_mut().enumerate() {
+            *slot = index;
+        }
         return table;
     }
     for rank in 0..8 {
@@ -110,6 +119,16 @@ fn train<const OUTPUT_BUCKETS: usize>() {
     let lr_start: f32 = env_or("LR", 0.001);
     let threads: usize = env_or("THREADS", 8);
     let buckets: usize = env_or("BUCKETS", 4);
+    // Finishing a schedule that was cut short, rather than starting it again.
+    //
+    // RESUME names a checkpoint directory; START is the superbatch to continue from, so the
+    // learning-rate schedule sees the same absolute index it would have in an uninterrupted
+    // run and a step that has already fired stays fired. The wall limit on the gpu partition
+    // is what makes this worth having: a run killed at superbatch 362 of 380 costs eight
+    // minutes to finish and an hour to repeat, and an arm trained 13% less than the arms it is
+    // being compared against is not a comparison.
+    let resume = env::var("RESUME").unwrap_or_default();
+    let start: usize = env_or("START", 1);
 
     // Bullet sizes the input layer from the distinct banks the table actually names, so the
     // affine below has to agree with that rather than with what was asked for. The layout
@@ -123,11 +142,18 @@ fn train<const OUTPUT_BUCKETS: usize>() {
         "BUCKETS={buckets} but the layout only names {banks} distinct banks; it saturates at 5"
     );
     let data = env::var("DATA").unwrap_or_else(|_| "aire/data/positions.data".to_string());
-    // A held-out set, built from shards that are not in the training file, so the loss it
-    // reports is generalisation rather than fit. Without it the only signal that a longer
-    // schedule has started to overfit is an hour-long match per configuration, which is the
-    // wrong way round when training itself takes two minutes.
-    let test_data = env::var("TEST_DATA").unwrap_or_default();
+    // No held-out set, because bullet does not have one.
+    //
+    // This used to pass TEST_DATA through as a TestDataset and the comment here claimed the
+    // reported loss was generalisation rather than fit. It never was. bullet_lib's value
+    // trainer answers a populated `test_set` with
+    //
+    //   Warning: Validation data not currently implemented! Please bother me on discord.
+    //
+    // and then ignores it -- see crates/bullet_lib/src/value.rs. Every loss this trainer has
+    // ever printed is training loss. The wiring is gone rather than left in place, so nothing
+    // reads a validation curve that was never computed. Generalisation is measured outside
+    // this program, by tools/blindspot.py on held-out positions and by a clock match.
     let net_id = env::var("NET_ID").unwrap_or_else(|_| "chess".to_string());
 
     // One superbatch is one pass over the data, so `end_superbatch` is the epoch count and the
@@ -164,11 +190,23 @@ fn train<const OUTPUT_BUCKETS: usize>() {
 
     let schedule = TrainingSchedule {
         net_id,
-        eval_scale: SCALE as f32,
+        // The sigmoid scale the loss is written in, and it belongs to the data, not to the
+        // trainer. The target is 0.6 * sigmoid(score / eval_scale) + 0.4 * game_result, so
+        // eval_scale has to be near the spread of the scores actually in the file. Our own
+        // labels have a median |score| of 518, and 400 spreads them well. The public Stockfish
+        // binpack has a median of 90: at 400 half its positions land inside 0.056 of 0.5, the
+        // score half of the target is nearly constant, and the network ends up fitting the
+        // game result instead of the evaluation. Three runs on that file calibrated to
+        // eval_scale 160-164 against 308-315 for every run on ours, and their correlation with
+        // Stockfish's evaluations was 0.87 against 0.97. That is the signature of it.
+        //
+        // Overridable, because a dataset swap that leaves this at the previous dataset's value
+        // is not a comparison of datasets.
+        eval_scale: env_or("TRAIN_SCALE", SCALE) as f32,
         steps: TrainingSteps {
             batch_size,
             batches_per_superbatch,
-            start_superbatch: 1,
+            start_superbatch: start,
             end_superbatch: epochs,
         },
         wdl_scheduler: wdl::ConstantWDL { value: wdl_weight },
@@ -176,26 +214,69 @@ fn train<const OUTPUT_BUCKETS: usize>() {
         // step schedule that never fires is the same as a constant one, so the step is
         // derived from the epoch count rather than hard coded at bullet's 18.
         lr_scheduler: lr::StepLR { start: lr_start, gamma: 0.1, step: (epochs * 2 / 3).max(1) },
-        save_rate: epochs,
+        // Eight checkpoints, not one at the end.
+        //
+        // bullet saves when `superbatch % save_rate == 0` or on the final superbatch, so
+        // `save_rate: epochs` writes exactly one checkpoint, after the last superbatch. On the
+        // gpu partition the wall limit is a SIGKILL, and a run that overruns by a minute then
+        // leaves nothing at all -- no weights to convert, no network to play, and the slot
+        // gone. It has already happened once, nine superbatches from the end of a 320
+        // superbatch schedule.
+        //
+        // A checkpoint is a few megabytes and takes well under a second, so the insurance is
+        // free: the worst case becomes losing the last eighth of the schedule rather than all
+        // of it. The slurm script already picks the highest-numbered checkpoint, so a partial
+        // run converts and screens exactly like a complete one.
+        save_rate: (epochs / 8).max(1),
     };
 
     let settings = LocalSettings {
         threads,
-        // Once per superbatch: often enough to see the curve turn, rare enough not to slow
-        // training, which is the whole reason a long schedule is affordable.
-        test_set: if test_data.is_empty() {
-            None
-        } else {
-            Some(TestDataset { path: &test_data, freq: batches_per_superbatch })
-        },
+        test_set: None,
         output_directory: "checkpoints",
         batch_queue_size: 64,
     };
 
-    let data_loader = loader::DirectSequentialDataLoader::new(&[data.as_str()]);
-
     println!("hidden {hidden}, {buckets} king buckets, {OUTPUT_BUCKETS} output buckets, {epochs} superbatches of {batches_per_superbatch} x {batch_size}");
-    println!("data {data}, wdl {wdl_weight}, lr {lr_start}, threads {threads}");
+    println!(
+        "data {data}, wdl {wdl_weight}, lr {lr_start}, threads {threads}, \
+         train scale {}",
+        env_or("TRAIN_SCALE", SCALE)
+    );
+    if !resume.is_empty() {
+        println!("resuming from {resume}, superbatches {start} to {epochs}");
+        trainer.load_from_checkpoint(&resume);
+    } else if start != 1 {
+        println!("START={start} without RESUME would train from scratch on a partial schedule");
+        std::process::exit(1);
+    }
 
-    trainer.run(&schedule, &settings, &data_loader);
+    // A path ending .binpack is Stockfish's own training format, which bullet reads directly.
+    // The rules put no restriction on training data -- only on shipping a network someone else
+    // trained -- and a public binpack holds on the order of a billion positions from Stockfish
+    // self-play against the 118M our own generation produced.
+    if data.ends_with(".binpack") {
+        use loader::sfbinpack::{MoveType, PieceType, SfBinpackLoader, TrainingDataEntry};
+
+        // The same filter tools/label.py applies when generating our own set, and for the same
+        // reason: a position whose best move is a capture, or where the side to move is in
+        // check, is decided by a tactic the search resolves, and fitting a static evaluation to
+        // it teaches the wrong thing. `ply >= 16` drops opening positions that repeat across
+        // millions of games and would otherwise dominate.
+        fn keep(entry: &TrainingDataEntry) -> bool {
+            entry.ply >= 16
+                && !entry.pos.is_checked(entry.pos.side_to_move())
+                && entry.score.unsigned_abs() <= 10000
+                && entry.mv.mtype() == MoveType::Normal
+                && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
+        }
+
+        let buffer_mb: usize = env_or("BINPACK_BUFFER_MB", 1024);
+        println!("reading binpack with a {buffer_mb}MB buffer on {threads} threads");
+        let data_loader = SfBinpackLoader::new(data.as_str(), buffer_mb, threads, keep);
+        trainer.run(&schedule, &settings, &data_loader);
+    } else {
+        let data_loader = loader::DirectSequentialDataLoader::new(&[data.as_str()]);
+        trainer.run(&schedule, &settings, &data_loader);
+    }
 }

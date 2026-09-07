@@ -4,15 +4,20 @@
 #   sbatch aire/bullet-buckets.slurm
 #   cat aire/data/bucket-sweep.txt
 #
-# Hidden width is closed. The note at the top of nnue.py has the measurement: every feature
-# update reads a row of the accumulator matrix, so BUCKETS x 768 x HIDDEN x 2 bytes has to stay
-# inside L2. At 128 wide with four king buckets that is 768KB and a node costs 484ns; at 256 it
-# is 1.5MB, it spills to L3, and a node costs 930ns. 192 was measured on the clock and lost 50
-# Elo. There is no room to make the network wider.
+# Hidden width is NOT closed, and an earlier version of this note said it was.
 #
-# Output buckets are not in that matrix. One bank is 2 x HIDDEN int16 -- 512 bytes -- and it is
-# read once per evaluation rather than once per feature, so eight of them cost four kilobytes
-# and nothing in nodes per second. It is the only capacity this architecture has left.
+# The claim was that BUCKETS x 768 x HIDDEN x 2 bytes has to stay inside L2, so 256 wide
+# "spills" and is ruled out. That is not what the numbers say. A feature update reads one row,
+# HIDDEN int16s, so cost is linear in width: 484ns a node at 128, 930ns at 256, which is 1.92x
+# for 2x the width and needs no cache story at all. It is a smooth trade, not a wall, and 192
+# losing 50 Elo on the clock was measured on our own material-dominated labels, where the extra
+# capacity had nothing to learn. On Stockfish data that trade may well reverse, which is why a
+# 256 wide arm is on the cluster rather than ruled out on a spreadsheet.
+#
+# Output buckets are the capacity that is genuinely free. One bank is 2 x HIDDEN int16 -- 512
+# bytes -- read once per evaluation rather than once per feature, so eight of them cost four
+# kilobytes and nothing in nodes per second. Width and bucket count both buy capacity too; they
+# just have a price, which is what the arms of this sweep and the architecture screen measure.
 #
 # Why phase in particular. The engine's losses are not blunders. A drawn game against a stronger
 # opponent went +133 at move 22 and dead level by move 38 with no move losing 100cp: eight small
@@ -81,6 +86,8 @@ TAG=${TAG:-obuck}
 RESULTS="$ORIGIN/aire/data/${TAG}-sweep.txt"
 SCREEN=${SCREEN:-aire/data/shard-1.epd}
 
+# A binpack run has no separate held-out file in this format; the clock match is the check.
+[ "${BINARY##*.}" = "binpack" ] && TEST_BINARY="$BINARY"
 for required in "$BINARY" "$TEST_BINARY"; do
   if [ ! -s "$required" ]; then
     echo "ERROR: $required is missing. Build both first:" >&2
@@ -88,15 +95,46 @@ for required in "$BINARY" "$TEST_BINARY"; do
     exit 1
   fi
 done
-POSITIONS=$(( $(stat -c %s "$BINARY") / 32 ))
+# A binpack is compressed and variable width, so its position count cannot be read off the
+# file size the way a bulletformat file's can. POSITIONS then has to be given, and it only sets
+# how many batches make a superbatch -- an estimate that is too low just means shorter
+# superbatches, not less data seen.
+case "$BINARY" in
+  *.binpack) POSITIONS=${POSITIONS:?POSITIONS must be set for a binpack} ;;
+  *)         POSITIONS=$(( $(stat -c %s "$BINARY") / 32 )) ;;
+esac
+# TARGET_SAMPLES fixes the total number of positions seen rather than the number of passes.
+#
+# A superbatch is one pass over the data, so two datasets of different sizes trained for the
+# same number of superbatches do not see the same amount of data. Comparing a 50M set against a
+# 118M set at 320 superbatches each would have the smaller one see 2.4x fewer positions, and it
+# would lose on volume while appearing to lose on distribution -- which is the one variable the
+# comparison exists to isolate. The control saw 320 x 118,035,504, so that is the number to
+# match. Cannot be computed at submission time, because the dataset does not exist yet when the
+# job is queued behind the one that builds it.
+if [ -n "${TARGET_SAMPLES:-}" ]; then
+  EPOCHS=$(( TARGET_SAMPLES / POSITIONS ))
+  [ "$EPOCHS" -lt 1 ] && EPOCHS=1
+  echo "TARGET_SAMPLES=$TARGET_SAMPLES over $POSITIONS positions -> $EPOCHS superbatches"
+fi
 echo "training on $POSITIONS positions, held-out set $(( $(stat -c %s "$TEST_BINARY") / 32 ))"
 
-# Screening installs each candidate at weights/net.npz, the only network the engine will load.
-# Put back what was there, or the repository is left holding an arbitrary sweep network.
-RESTORE=""
-if [ -f weights/net.npz ]; then RESTORE="$(mktemp)"; cp weights/net.npz "$RESTORE"; fi
-restore() { [ -n "$RESTORE" ] && cp "$RESTORE" weights/net.npz && echo "restored weights/net.npz"; }
-trap restore EXIT
+# Screening needs the candidate installed at weights/net.npz, the only network the engine will
+# load -- so it happens in a scratch copy of the repository, never in the repository itself.
+#
+# The previous version installed into the real weights/net.npz and put it back with an EXIT
+# trap. That works right up until the job is killed at its wall limit, which is a SIGKILL and
+# runs no trap. It happened: a bucketed network was left installed, and every job afterwards
+# read a 2-D output layer with code expecting a 1-D one. Three hundred array tasks failed in
+# four seconds each with a numba typing error pointing at nnue.py, which is a long way from the
+# actual cause. A scratch directory cannot fail that way, and it also lets two of these run at
+# once without fighting over the same file.
+SCRATCH="${TMPDIR:-/tmp}/screen-${SLURM_JOB_ID:-$$}"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/weights"
+cp "$ORIGIN"/*.py "$SCRATCH/"
+cp -r "$ORIGIN/tools" "$ORIGIN/harness" "$ORIGIN/pyproject.toml" "$ORIGIN/uv.lock" "$SCRATCH/"
+cleanup() { rm -rf "$SCRATCH"; }
+trap cleanup EXIT
 
 : > "$RESULTS"
 
@@ -112,7 +150,9 @@ else
 fi
 
 for OB in $OUTPUTS; do
-  NET_ID="h${HIDDEN}b${NBUCKETS}ob${OB}"
+  # TAG is part of the name, not just of the output file. Without it every run over different
+  # data shares a checkpoint directory, and the newest is not necessarily the one just trained.
+  NET_ID="${TAG}-h${HIDDEN}b${NBUCKETS}ob${OB}"
   echo
   echo "=============== $NET_ID ==============="
 
@@ -122,13 +162,32 @@ for OB in $OUTPUTS; do
       TEST_DATA="$ORIGIN/$TEST_BINARY" THREADS="${SLURM_CPUS_PER_TASK:-8}" \
       cargo run --release --features cuda )
 
-  CHECKPOINT=$(ls -d aire/bullet-trainer/checkpoints/"$NET_ID"-* | sort -t- -k2 -n | tail -1)
-  KEEP="aire/data/${TAG}-${NET_ID}.npz"
+  # Sort on the trailing superbatch number, not on "the second hyphen-separated field" -- the
+  # path itself contains hyphens (aire/bullet-trainer/...), so -t- -k2 was sorting on
+  # "trainer/checkpoints/..." which is identical for every run. With three checkpoints sharing a
+  # NET_ID it silently converted another run's network, and the only reason it was caught is
+  # that tools/blindspot.py reported two supposedly different networks with identical error.
+  # sed, not awk. The awk version of this line was written from inside a single-quoted ssh
+  # command and kept the '\"'\"' escaping that only makes sense there. At the top level of a
+  # script that resolves to a double-quoted string, so the shell -- not awk -- expanded $NF,
+  # and `set -u` killed the job with "NF: unbound variable". It killed three jobs, every one of
+  # them after training had finished, because this line only runs once the GPU work is done.
+  #
+  # Sort on the trailing superbatch number. Not "the second hyphen-separated field": the path
+  # itself contains hyphens (aire/bullet-trainer/...), so -t- -k2 sorted on a field identical
+  # for every run, and with three checkpoints sharing a NET_ID it silently converted another
+  # run's network.
+  CHECKPOINT=$(ls -d aire/bullet-trainer/checkpoints/"$NET_ID"-* \
+    | sed 's/.*-\([0-9][0-9]*\)$/\1 &/' | sort -k1,1n | tail -1 | cut -d' ' -f2-)
+  [ -d "$CHECKPOINT" ] || { echo "ERROR: no checkpoint for $NET_ID" >&2; exit 1; }
+  echo "converting $CHECKPOINT"
+  KEEP="aire/data/${NET_ID}.npz"
   uv run python tools/from_bullet.py "$CHECKPOINT/raw.bin" \
     --buckets "$NBUCKETS" --output-buckets "$OB" --out "$KEEP"
 
-  cp "$KEEP" weights/net.npz
-  SUMMARY=$(uv run python tools/side_bias.py "$SCREEN" --limit 4000 | tail -3)
+  cp "$KEEP" "$SCRATCH/weights/net.npz"
+  SUMMARY=$( cd "$SCRATCH" && uv run python tools/side_bias.py "$ORIGIN/$SCREEN" --limit 4000 \
+             | tail -3 )
   echo "$SUMMARY"
   CORRELATION=$(echo "$SUMMARY" | awk '/^  all/ {print $7}')
   printf "%-14s output_buckets=%-3s correlation=%s\n" \

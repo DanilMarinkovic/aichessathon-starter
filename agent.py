@@ -24,7 +24,17 @@ import numpy as np
 import nnue
 import searcher
 from position import HASH, from_board, to_uci
-from searcher import BEST_DEPTH, BEST_SCORE, MAX_PLY, NODES, PATH_LIMIT, STOP, USE_NNUE
+from searcher import (
+    BEST_DEPTH,
+    BEST_SCORE,
+    MAX_PLY,
+    NODES,
+    PATH_LIMIT,
+    SOFT,
+    STABLE,
+    STOP,
+    USE_NNUE,
+)
 
 # Wall time the referee charges us that we never see: the JSON round trip, building the board,
 # and handing the move back. Measured at a few milliseconds; held well clear of that.
@@ -204,17 +214,32 @@ def _think(board: chess.Board, time_left_ms: int) -> str:
         budget = _budget_ms(time_left_ms)
         # A node ceiling in case the timer thread never fires. At the speeds this engine runs
         # it is several times the nodes the budget can buy, so it never binds on a healthy move.
-        node_limit = int(budget / 1000.0 * 20_000_000) + 100_000
+        node_limit = int(hard_ceiling(budget, time_left_ms) / 1000.0 * 20_000_000) + 100_000
     searcher.CONTROL[STOP] = 0
+    searcher.CONTROL[SOFT] = 0
 
-    timer = threading.Timer(budget / 1000.0, _raise_flag)
-    timer.daemon = True
+    # Two deadlines rather than one. The soft deadline is the budget the clock allows; reaching
+    # it ends the search unless the root move changed on the last completed iteration, in which
+    # case the search may run on to the hard deadline. A position still changing its mind is the
+    # one where another ply is worth most, and a flat budget spends the same on it as on a
+    # position that settled at depth six.
+    #
+    # The hard deadline never exceeds the safety cap the budget itself already obeys, so the
+    # extension cannot cause a flag fall: whatever fraction of the remaining clock was
+    # considered safe for one move stays the ceiling.
+    hard = hard_ceiling(budget, time_left_ms)
+    soft_timer = threading.Timer(budget / 1000.0, _raise_soft)
+    hard_timer = threading.Timer(hard / 1000.0, _raise_flag)
+    soft_timer.daemon = True
+    hard_timer.daemon = True
     began = time.monotonic()
-    timer.start()
+    soft_timer.start()
+    hard_timer.start()
     try:
         packed = searcher.run(MAX_DEPTH, root_offset, node_limit)
     finally:
-        timer.cancel()
+        soft_timer.cancel()
+        hard_timer.cancel()
     elapsed = (time.monotonic() - began) * 1000.0
 
     uci = to_uci(packed) if packed else ""
@@ -238,13 +263,40 @@ def _think(board: chess.Board, time_left_ms: int) -> str:
         f"depth {int(searcher.CONTROL[BEST_DEPTH])} score {int(searcher.CONTROL[BEST_SCORE])} "
         f"nodes {nodes} "
         f"time {elapsed:.0f}ms ({nodes / max(elapsed, 1.0):.0f}kn/s) "
-        f"budget {budget:.0f}ms move {uci}"
+        f"budget {budget:.0f}ms hard {hard:.0f}ms stable {int(searcher.CONTROL[STABLE])} "
+        f"move {uci}"
     )
     return uci
 
 
+def hard_ceiling(budget: float, time_left_ms: int) -> float:
+    """The longest this move may take once the extension is allowed for."""
+    ceiling = min(budget * 2.0, max(1.0, time_left_ms - OVERHEAD_MS) * 0.35)
+    return budget if ceiling < budget else ceiling
+
+
 def _raise_flag() -> None:
     searcher.CONTROL[STOP] = 1
+
+
+def _raise_soft() -> None:
+    """The budget is gone. Decide here whether that ends the search.
+
+    Read the stability counter rather than always deferring to the next iteration boundary. If
+    the root move held through the last completed iteration the search has converged and this
+    stops it exactly where the old single deadline did -- mid-iteration, keeping the previous
+    depth's answer, which is what an unfinished iteration is worth anyway. Only an unsettled
+    root defers, and only that case is allowed to run into the extension.
+
+    Deferring unconditionally instead looks similar and is not: a settled position would finish
+    whatever iteration it had started, which measured 48% over budget on the opening position.
+    That is a uniform increase in time spent, and a uniform increase was already measured at
+    -0.6 Elo. The point is to move time between positions, not to spend more everywhere.
+    """
+    if int(searcher.CONTROL[STABLE]) >= 1:
+        searcher.CONTROL[STOP] = 1
+    else:
+        searcher.CONTROL[SOFT] = 1
 
 
 def _select_evaluation() -> None:

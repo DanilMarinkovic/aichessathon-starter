@@ -1,0 +1,25 @@
+# How fast can bullet actually read the Stockfish binpack?
+#
+# The GPU partition kills a job at its wall limit and bullet only writes a checkpoint at the
+# end of its schedule, so a training run sized from a guessed rate is a coin flip on losing the
+# whole slot. The rate for a memory-mapped bulletformat file does not transfer: a binpack is a
+# compressed, delta-encoded move stream and every position has to be decoded and filtered on
+# the CPU before the GPU sees it.
+#
+# This measures exactly that decode-and-filter loop, with bullet's filter, on the real file.
+# Nothing here ships; it is a stopwatch.
+
+[package]
+name = "binpack-rate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sfbinpack = "0.6"
+
+[[bin]]
+name = "binpack-rate"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

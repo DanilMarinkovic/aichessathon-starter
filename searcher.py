@@ -35,9 +35,11 @@ from bitboards import (
 from evaluate import evaluate
 from movegen import MAX_MOVES, generate
 from nnue import HIDDEN as NNUE_HIDDEN
+from nnue import TRAINED as NNUE_TRAINED
 from nnue import advance as nnue_advance
 from nnue import forward as nnue_forward
 from nnue import new_cache as nnue_new_cache
+from nnue import output_bucket as nnue_output_bucket
 from nnue import refresh as nnue_refresh
 from position import (
     EN_PASSANT,
@@ -46,6 +48,7 @@ from position import (
     HASH,
     NFIELDS,
     NO_EP,
+    OCC_ALL,
     SIDE,
     in_check,
     make_move,
@@ -82,6 +85,14 @@ BEST_DEPTH = 5
 # Which evaluation to use. Lives in CONTROL rather than a global because numba freezes a
 # global array into compiled code as a read-only constant and folds the branch away.
 USE_NNUE = 6
+# Raised by the clock thread when the ordinary budget is gone. It is not STOP: it asks the
+# search to stop at a sensible boundary rather than wherever it happens to be, which is the
+# whole point -- a search cut mid-iteration keeps the previous depth's answer anyway, so the
+# time spent on the unfinished iteration bought nothing.
+SOFT = 7
+# How many completed iterations in a row have agreed on the same root move. Zero means the
+# answer just changed, which is exactly when stopping is worst.
+STABLE = 8
 # Static evaluation correction history.
 #
 # The network's evaluation of a position is systematically wrong in ways that repeat: the same
@@ -127,6 +138,16 @@ KILLERS = np.zeros((MAX_PLY + 8, 2), dtype=np.int32)
 HISTORY = np.zeros((12, 64), dtype=np.int64)
 PATH = np.zeros(PATH_LIMIT + MAX_PLY + 8, dtype=np.uint64)
 CONTROL = np.zeros(CORR_BASE + 2 * CORR_SIZE, dtype=np.int64)
+# The network is the evaluation whenever one is loaded. Set here, at import, and not left for
+# each caller: CONTROL is zeros, so the old default was the hand-crafted evaluation, and for
+# weeks every tool that drove the search itself -- tools/probe.py, tools/nodecost.py -- silently
+# measured that instead of the network. It is how a node-cost sweep came to report five network
+# shapes as costing the same to within a few percent: none of them was in use. agent.py still
+# sets the same value explicitly, so what ships is unchanged; what changes is that forgetting is
+# no longer possible. The hand-crafted evaluation stays reachable by writing a 0 here, which is
+# worth keeping: flipping between two evaluations of very different cost is how a measurement
+# tool gets checked against an answer that is already known.
+CONTROL[USE_NNUE] = 1 if NNUE_TRAINED else 0
 
 # One network accumulator per ply, mirroring how positions are already stacked. numba freezes
 # the array's identity into the compiled code and reads its contents at run time, so the search
@@ -305,7 +326,9 @@ def score_position(
     """Whichever evaluation is in force. The branch is on a value that never changes mid-search."""
     side = np.int64(states[ply, SIDE])
     if control[USE_NNUE] != 0:
-        raw = np.int32(nnue_forward(accumulators[ply], side))
+        raw = np.int32(
+            nnue_forward(accumulators[ply], side, nnue_output_bucket(states[ply, OCC_ALL]))
+        )
     else:
         raw = np.int32(evaluate(states[ply]))
     # Corrected here rather than at each use, so the futility margins, the null-move test and
@@ -803,6 +826,7 @@ def search_position(
     control[BEST_MOVE] = 0
     control[BEST_SCORE] = 0
     control[BEST_DEPTH] = 0
+    control[SOFT] = 0
 
     for index in range(killers.shape[0]):
         killers[index, 0] = 0
@@ -815,6 +839,9 @@ def search_position(
 
     best_move = np.int64(0)
     best_score = np.int32(0)
+    previous_best = np.int64(0)
+    stable = np.int64(0)
+    control[STABLE] = 0
     for depth in range(1, max_depth + 1):
         window = np.int32(30)
         while True:
@@ -843,7 +870,28 @@ def search_position(
         best_move = control[BEST_MOVE]
         control[BEST_SCORE] = np.int64(best_score)
         control[BEST_DEPTH] = depth
+
+        # Has the answer settled? An iteration that returns the same root move as the last one
+        # is evidence the search has converged; one that changes it is evidence it has not.
+        if best_move == previous_best:
+            stable += 1
+        else:
+            stable = 0
+        previous_best = best_move
+        control[STABLE] = stable
+
         if abs(best_score) > MATE_THRESHOLD:
+            break
+
+        # The ordinary budget is gone. Stop if the answer has held for an iteration; keep going
+        # if it just moved, up to the hard limit the clock thread still enforces.
+        #
+        # This redistributes time rather than adding it. Spending uniformly more was measured at
+        # -0.6 Elo, so the average is not the constraint -- where it goes is. A position whose
+        # best move is still changing at the budget is precisely the one where another ply pays,
+        # and a game was lost to exactly that: the refutation needed depth 15 and the search
+        # stopped at 14 with time on the clock.
+        if control[SOFT] != 0 and stable >= 1:
             break
 
     if best_move == 0:
@@ -874,6 +922,6 @@ def reset() -> None:
     TT_DATA.fill(0)
     HISTORY.fill(0)
     KILLERS.fill(0)
-    # This clears the correction table too, which now lives in the tail of CONTROL.
+    # This clears the correction table too, which lives in the tail of CONTROL.
     CONTROL.fill(0)
     CONTROL[USE_NNUE] = evaluation

@@ -34,6 +34,12 @@ import chess.pgn
 
 DEFAULT_OPENINGS = Path(__file__).resolve().parent / "openings.epd"
 MATE_SCORE = 30000
+# Screening the random opening plies. A candidate is rejected if a shallow search says the side
+# that just played it has fallen more than SCREEN_MARGIN behind; SCREEN_TRIES bounds the work
+# when every move is bad, which happens in genuinely lost positions and must not loop.
+SCREEN_NODES = 5_000
+SCREEN_TRIES = 6
+SCREEN_MARGIN = 200
 SKIP_OPENING_PLIES = 8
 # Odd, and that is the whole point. Sampling `ply % 2 == 0` from a game that opens with white
 # to move yields white-to-move positions and nothing else: the first dataset built this way was
@@ -55,19 +61,53 @@ def _selfplay(fen: str, nodes: int, rng: random.Random, random_plies: int) -> tu
     A few random plies are played first. Under a fixed node count the engine is deterministic,
     so without them every game from a given opening would be the same game, and the data would
     be a handful of lines repeated thousands of times.
+
+    Those random plies are screened, and it matters more than it sounds. Chosen uniformly from
+    the legal moves they hand over material immediately: measured on a shard generated that way,
+    the median absolute evaluation at moves 0-9 is 389cp, before the engine has played a move.
+    The whole set inherits it -- material count alone explains 79.7% of the variance in the
+    labels -- and a network trained on it learns to count material and little else. Ours values
+    a position at -544 that Stockfish values at +455, then agrees to within 8cp once material is
+    restored.
+
+    So a candidate is played, the position it leads to is searched shallowly, and it is rejected
+    if the side that moved just threw the game away. This is Stockfish's random_multi_pv idea
+    arrived at from the other end: keep the diversity, drop the blunders. A rejected candidate
+    costs one shallow search, and a handful of those is nothing against a game of full-strength
+    moves.
     """
     import numpy as np
 
     import searcher
     from position import HASH, from_board, to_uci
-    from searcher import STOP
+    from searcher import BEST_SCORE, STOP
+
+    def _shallow(position: chess.Board) -> int:
+        """The score for the side to move, from a cheap search."""
+        searcher.STATES[0] = from_board(position)
+        searcher.PATH[:] = 0
+        searcher.CONTROL[STOP] = 0
+        searcher.run(64, 0, SCREEN_NODES)
+        return int(searcher.CONTROL[BEST_SCORE])
 
     board = chess.Board(fen)
     for _ in range(random_plies):
         legal = list(board.legal_moves)
         if not legal:
             break
-        board.push(rng.choice(legal))
+        rng.shuffle(legal)
+        chosen = legal[0]
+        for candidate in legal[:SCREEN_TRIES]:
+            board.push(candidate)
+            # The score is now from the opponent's point of view, so negate it to ask what the
+            # move did for the side that played it.
+            kept = -_shallow(board) > -SCREEN_MARGIN
+            board.pop()
+            if kept:
+                chosen = candidate
+                break
+        board.push(chosen)
+    searcher.reset()
 
     searcher.reset()
     history: list[int] = []

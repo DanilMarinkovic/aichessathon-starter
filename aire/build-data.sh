@@ -28,6 +28,16 @@ HELD_OUT=${HELD_OUT:-8}          # how many shards to reserve for validation
 PREFIX=${PREFIX:-shard}
 TRAIN_OUT=${TRAIN_OUT:-positions}
 TEST_OUT=${TEST_OUT:-test}
+# REBALANCE=1 thins the evaluation bands on the *training* file only. See tools/to_bullet.py
+# for the measurement behind it: material count alone explains 79.7% of the variance in the
+# labels as generated, and the network duly learned to count material and little else.
+#
+# The held-out file is deliberately left alone. Its job is to say how well the network evaluates
+# the positions the engine actually meets, and rebalancing it too would answer a question about
+# the filtered distribution instead. The two files then have different distributions, so the
+# training and validation losses stop being comparable to each other -- which costs nothing,
+# because the comparison that decides anything is played on a clock.
+REBALANCE=${REBALANCE:-0}
 
 mapfile -t SHARDS < <(ls "$DATA"/${PREFIX}-*.epd 2>/dev/null | sort -V)
 if [ "${#SHARDS[@]}" -lt $((HELD_OUT * 4)) ]; then
@@ -53,7 +63,13 @@ echo "  test  $(wc -l < "$DATA/$TEST_OUT.epd") positions"
 
 for name in "$TRAIN_OUT" "$TEST_OUT"; do
   echo "converting $name..."
-  uv run python tools/to_bullet.py "$DATA/$name.epd" "$DATA/$name.txt"
+  FLAGS=""
+  if [ "$REBALANCE" = "1" ] && [ "$name" = "$TRAIN_OUT" ]; then
+    FLAGS="--rebalance"
+    echo "  rebalancing the evaluation bands"
+  fi
+  # shellcheck disable=SC2086
+  uv run python tools/to_bullet.py $FLAGS "$DATA/$name.epd" "$DATA/$name.txt"
   cargo run --release --manifest-path "$HOME/bullet/crates/utils/Cargo.toml" -- \
     convert --from text --input "$DATA/$name.txt" --output "$DATA/$name.data" --threads 8
   # The text form is the biggest file here and is dead once the binary exists.

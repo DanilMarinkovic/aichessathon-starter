@@ -45,6 +45,15 @@ def main() -> None:
     if not nnue.TRAINED:
         raise SystemExit("no trained network at weights/net.npz, nothing to calibrate")
 
+    # Say out loud how far the network trained, in the same log as the measurement that follows.
+    # measure-nets calibrates a candidate immediately before playing it, so this is the last
+    # chance for "this ran 47 of 380 superbatches" to appear next to the Elo it produced.
+    stored = np.load(arguments.weights)
+    if "superbatches" in stored:
+        print(f"network trained for {int(stored['superbatches'])} superbatches")
+    else:
+        print("network carries no superbatch count; converted before provenance was recorded")
+
     fens, reference = read(arguments.positions, arguments.limit)
     if len(fens) < 500:
         raise SystemExit(f"only {len(fens)} positions; too few to fit a scale on")

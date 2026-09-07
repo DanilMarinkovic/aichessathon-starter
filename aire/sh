@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Run a command on Aire over exactly one shared SSH connection.
+#
+#   bash aire/sh 'squeue -u $USER'
+#   bash aire/sh < script.sh          # stdin is fed to a remote bash
+#
+# Why this exists. On 7 September we lost SSH access to the cluster for over an hour, almost
+# certainly to a fail2ban-style block, after a day of opening a fresh connection for nearly
+# every command. ~/.ssh/config already had ControlMaster auto with ControlPersist, which should
+# have made that one connection -- but ControlMaster only reuses a socket that already exists.
+# Two ssh processes started at the same moment with no master up both dial out, both try to
+# become master, and the multiplexing buys nothing. Running commands two at a time, which is
+# the normal way to work quickly, therefore defeats it exactly when it matters most.
+#
+# So: take a lock, make sure a master is up, and only then run. Concurrent callers queue behind
+# the lock for the few seconds the master takes to establish, and every one of them afterwards
+# travels down the same TCP connection.
+#
+# The other half of the discipline is not in this file. Do not poll from here in a loop -- put
+# the loop on the far side, inside one invocation:
+#
+#   bash aire/sh 'until [ -s some.log ]; do sleep 30; done; cat some.log'
+#
+# One connection that waits costs nothing; forty connections that check cost access.
+
+set -euo pipefail
+HOST=${AIRE_HOST:-aire}
+LOCK=${TMPDIR:-/tmp}/aire-master.lock
+
+# BatchMode so a missing key fails immediately and visibly rather than sitting on a password
+# prompt. An interactive prompt from a non-interactive caller is what produced the auth failure
+# that most likely triggered the block.
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4)
+
+exec 9>"$LOCK"
+flock 9
+if ! ssh -O check "$HOST" >/dev/null 2>&1; then
+  ssh "${ssh_opts[@]}" -MNf "$HOST" || {
+    echo "aire/sh: cannot open a master connection to $HOST" >&2
+    echo "  the cluster may be unreachable, or this address may be blocked." >&2
+    echo "  do not retry in a loop: repeated attempts extend most bans." >&2
+    exit 1
+  }
+fi
+exec 9>&-
+
+if [ "$#" -gt 0 ]; then
+  ssh "${ssh_opts[@]}" "$HOST" "$@"
+else
+  ssh "${ssh_opts[@]}" "$HOST" 'bash -s'
+fi

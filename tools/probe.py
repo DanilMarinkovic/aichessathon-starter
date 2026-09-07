@@ -20,12 +20,16 @@ import numpy as np
 import searcher
 from position import HASH, from_board, to_uci
 from searcher import BEST_DEPTH, BEST_SCORE, NODES, STOP
+from tools.engine import use_network
 
 LADDER = (50_000, 200_000, 1_000_000, 5_000_000)
 
 
 def ours(board: chess.Board, nodes: int) -> tuple[str, int, int, int]:
     searcher.reset()
+    # reset() preserves the flag, so this only has to happen once -- but it costs nothing and
+    # it means no caller can forget.
+    use_network(announce=False)
     state = from_board(board)
     searcher.STATES[0] = state
     searcher.PATH[:] = 0
