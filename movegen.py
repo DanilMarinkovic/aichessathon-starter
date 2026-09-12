@@ -9,6 +9,8 @@ legality keeps one rule in one place.
 and skips quiet moves and castling.
 """
 
+import time
+
 import numpy as np
 from numba import int32, int64, njit, uint64
 
@@ -64,7 +66,10 @@ from position import (
 MAX_MOVES = 256
 
 
-@njit(int64(uint64[::1], int32[::1], int64), nogil=True, cache=False)
+_SIG_generate = int64(uint64[::1], int32[::1], int64)
+
+
+@njit(nogil=True, cache=False)
 def generate(state: np.ndarray, moves: np.ndarray, captures_only: np.int64) -> np.int64:
     count = 0
     side = np.int64(state[SIDE])
@@ -252,3 +257,21 @@ def generate(state: np.ndarray, moves: np.ndarray, captures_only: np.int64) -> n
                 count += 1
 
     return count
+
+
+_COMPILE_PAIRS = (
+    (generate, _SIG_generate),
+)
+
+
+def _compile_all(deadline: float | None = None) -> bool:
+    """Compile this module's functions, stopping if `deadline` has passed.
+
+    Returns whether it finished. Ordered so the cheap functions land first: whatever
+    the init budget can afford does not have to be paid out of the first move's clock.
+    """
+    for fn, sig in _COMPILE_PAIRS:
+        if deadline is not None and time.monotonic() > deadline:
+            return False
+        fn.compile(sig)
+    return True

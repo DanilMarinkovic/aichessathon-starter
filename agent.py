@@ -18,13 +18,17 @@ import os
 import threading
 import time
 
-import chess
-import numpy as np
+# Taken before the project modules, whose numba compilation is what the init budget
+# is actually spent on. Only numpy, numba and python-chess precede it, about a second.
+_import_started = time.monotonic()
 
-import nnue
-import searcher
-from position import HASH, from_board, to_uci
-from searcher import (
+import chess  # noqa: E402
+import numpy as np  # noqa: E402
+
+import nnue  # noqa: E402
+import searcher  # noqa: E402
+from position import HASH, from_board, to_uci  # noqa: E402
+from searcher import (  # noqa: E402
     BEST_DEPTH,
     BEST_SCORE,
     MAX_PLY,
@@ -145,7 +149,11 @@ def _record_after(board: chess.Board, move: chess.Move) -> None:
         key = int(from_board(board)[HASH])
     finally:
         board.pop()
-    while len(_after) >= len(_history):
+    # `_after` is guarded as well as compared. When both lists are empty -- _fallback reached
+    # before anything recorded the position, which happens if _think raises before its own
+    # _record -- `0 >= 0` held and this popped an empty list, turning the move that exists to
+    # rescue a failed search into a crash that loses the game.
+    while _after and len(_after) >= len(_history):
         _after.pop()
     _after.append(key)
 
@@ -157,6 +165,10 @@ def _fallback(board: chess.Board) -> str:
     that goes unrecorded here would put every later entry on the wrong parity and quietly break
     repetition detection for the rest of the game.
     """
+    # Whatever brought us here may have skipped _record, and `_after` must never run ahead of
+    # `_history`: entry k of one sits at PATH[2k] and entry k of the other at PATH[2k + 1].
+    if not _history:
+        _record(int(from_board(board)[HASH]))
     best = None
     best_value = -1
     for move in board.legal_moves:
@@ -169,6 +181,29 @@ def _fallback(board: chess.Board) -> str:
         return "0000"
     _record_after(board, best)
     return best.uci()
+
+
+_compiler: threading.Thread | None = None
+_waited_for_compile = False
+
+
+def _ensure_compiling() -> threading.Thread:
+    """Compile the search on a worker thread, started at the first move rather than at import.
+
+    negamax, quiescence and search_position are 90% of numba's compilation work. Compiling them
+    eagerly spent it all inside the import budget -- 51 seconds against a limit of 30. Declaring
+    their signatures in searcher.compile_search() instead of on the decorator keeps the emitted
+    code identical; letting numba infer the types costs 14% of the node rate.
+
+    It does not start at import. The platform gives one core, so a background thread started
+    there does not overlap with the rest of the import -- it competes with it, and pushed the
+    import past 30 seconds on the platform while looking free on a many-core laptop.
+    """
+    global _compiler
+    if _compiler is None:
+        _compiler = threading.Thread(target=searcher.compile_search, name="compile", daemon=True)
+        _compiler.start()
+    return _compiler
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
@@ -185,6 +220,21 @@ def get_move(fen: str, time_left_ms: int) -> str:
             _record(int(from_board(board)[HASH]))
             _record_after(board, legal[0])
             return legal[0].uci()
+        global _waited_for_compile
+        compiler = _ensure_compiling()
+        if compiler.is_alive():
+            # Wait once, on the first move, while the clock is still full -- at the real control
+            # that is where the remaining compilation fits. Never wait again: a control too short
+            # to finish it would otherwise spend a slice of every move waiting for something that
+            # was not going to arrive, and those slices add up to a flag, which is a loss where a
+            # fallback move is not.
+            if not _waited_for_compile:
+                _waited_for_compile = True
+                compiler.join(max(0.0, (time_left_ms - OVERHEAD_MS) / 1000.0 * 0.8))
+            if compiler.is_alive():
+                print(f"still compiling, playing a fallback move with {time_left_ms}ms left")
+                _record(int(from_board(board)[HASH]))
+                return _fallback(board)
         try:
             return _think(board, time_left_ms)
         except Exception as error:  # the clock runs through a bug; a legal move does not
@@ -331,4 +381,19 @@ def _warm() -> None:
 
 
 _select_evaluation()
-_warm()
+
+# The search is compiled on a background thread rather than at import.
+#
+# negamax, quiescence and search_position are 90% of numba's compilation work, and compiling
+# them eagerly put the whole cost inside the import budget -- 51 seconds of it, against a limit
+# of 30. Declaring their signatures in searcher.compile_search() rather than on the decorator
+# keeps the generated code identical; letting numba infer the types instead costs 14% of the
+# node rate. Only the timing moves: import returns in about 13 seconds and the rest happens on
+# the clock, where 120 seconds can absorb it and 30 could not.
+# Spend what is left of the init budget compiling, then stop and leave the rest to the first
+# move. The platform reports init times of 2-11 seconds for this agent against a 30 second
+# limit, so most of the budget was going unused while move one paid 44 seconds of compilation
+# out of the match clock. The deadline is measured from the start of our own import, which does
+# not include container start -- hence a target well short of the limit rather than close to it.
+_INIT_COMPILE_TARGET_S = 12.0
+searcher.compile_search(deadline=_import_started + _INIT_COMPILE_TARGET_S)

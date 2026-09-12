@@ -19,6 +19,8 @@ X-rays matter and are handled: when a piece steps off a line, a rook or bishop b
 the exchange, so the attacker set is recomputed against the shrinking occupancy each time.
 """
 
+import time
+
 import numpy as np
 from numba import int32, int64, njit, uint64
 
@@ -56,7 +58,10 @@ from position import (
 VALUE = np.array([0, 100, 320, 330, 500, 900, 20000], dtype=np.int64)
 
 
-@njit(uint64(uint64[::1], int64, uint64), nogil=True, cache=False)
+_SIG_attackers_to = uint64(uint64[::1], int64, uint64)
+
+
+@njit(nogil=True, cache=False)
 def attackers_to(state: np.ndarray, square: np.int64, occupied: np.uint64) -> np.uint64:
     """Every piece of either colour attacking a square, for a given occupancy.
 
@@ -76,7 +81,10 @@ def attackers_to(state: np.ndarray, square: np.int64, occupied: np.uint64) -> np
     return attackers & occupied
 
 
-@njit(int64(uint64[::1], int32, int64), nogil=True, cache=False)
+_SIG_see_ge = int64(uint64[::1], int32, int64)
+
+
+@njit(nogil=True, cache=False)
 def see_ge(state: np.ndarray, move: np.int32, threshold: np.int64) -> np.int64:
     """Whether the exchange starting with this move is worth at least `threshold`."""
     origin = move_from(move)
@@ -157,7 +165,10 @@ def see_ge(state: np.ndarray, move: np.int32, threshold: np.int64) -> np.int64:
     return result
 
 
-@njit(int64(uint64[::1], int32), nogil=True, cache=False)
+_SIG_see_value = int64(uint64[::1], int32)
+
+
+@njit(nogil=True, cache=False)
 def see_value(state: np.ndarray, move: np.int32) -> np.int64:
     """The exchange value in centipawns, by binary search over see_ge.
 
@@ -173,3 +184,23 @@ def see_value(state: np.ndarray, move: np.int32) -> np.int64:
         else:
             high = middle - 1
     return low
+
+
+_COMPILE_PAIRS = (
+    (attackers_to, _SIG_attackers_to),
+    (see_ge, _SIG_see_ge),
+    (see_value, _SIG_see_value),
+)
+
+
+def _compile_all(deadline: float | None = None) -> bool:
+    """Compile this module's functions, stopping if `deadline` has passed.
+
+    Returns whether it finished. Ordered so the cheap functions land first: whatever
+    the init budget can afford does not have to be paid out of the first move's clock.
+    """
+    for fn, sig in _COMPILE_PAIRS:
+        if deadline is not None and time.monotonic() > deadline:
+            return False
+        fn.compile(sig)
+    return True

@@ -67,6 +67,7 @@ promotion changes a piece's type. Each is a special case, and a wrong one corrup
 evaluation silently rather than crashing.
 """
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -239,7 +240,10 @@ OUT_BUCKETS = int(OUTPUT.shape[0])
 OUT_DIVISOR = -(-32 // OUT_BUCKETS)
 
 
-@njit(int64(uint64), nogil=True, cache=False, inline="always")
+_SIG_output_bucket = int64(uint64)
+
+
+@njit(nogil=True, cache=False)
 def output_bucket(occupied: np.uint64) -> np.int64:
     """Which output bank this position selects. Clamped, because a position reached by a
     promotion the trainer never saw must not index past the end of the array."""
@@ -251,7 +255,10 @@ def output_bucket(occupied: np.uint64) -> np.int64:
     return np.int64(bucket)
 
 
-@njit(types.UniTuple(int64, 2)(int64, int64), nogil=True, cache=False, inline="always")
+_SIG_perspective = types.UniTuple(int64, 2)(int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def perspective(king_square: np.int64, flip: np.int64):
     """Where one perspective's weights start, and whether its board is mirrored.
 
@@ -263,7 +270,10 @@ def perspective(king_square: np.int64, flip: np.int64):
     return KING_BUCKET[king ^ mirror] * INPUTS, mirror
 
 
-@njit(int64(int64, int64, int64, int64, int64), nogil=True, cache=False, inline="always")
+_SIG__index = int64(int64, int64, int64, int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def _index(
     side: np.int64, piece: np.int64, square: np.int64, offset: np.int64, mirror: np.int64
 ) -> np.int64:
@@ -280,7 +290,10 @@ def _index(
     return offset + other * 64 + (square ^ 56 ^ mirror)
 
 
-@njit(int64(int16[:, ::1], int64, int64, int64), nogil=True, cache=False, inline="always")
+_SIG__apply = int64(int16[:, ::1], int64, int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def _apply(
     accumulator: np.ndarray, side: np.int64, index: np.int64, sign: np.int64
 ) -> np.int64:
@@ -293,16 +306,27 @@ def _apply(
     return 0
 
 
-@njit(int64(int64, int64, int64), nogil=True, cache=False, inline="always")
+_SIG__slot = int64(int64, int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def _slot(side: np.int64, offset: np.int64, mirror: np.int64) -> np.int64:
     return (side * BUCKETS + offset // INPUTS) * 2 + (1 if mirror != 0 else 0)
 
 
-@njit(
-    int64(uint64[::1], int16[:, ::1], int64, int64, int64, int16[:, ::1], uint64[:, ::1]),
-    nogil=True,
-    cache=False,
+_SIG_refresh_side = int64(
+    uint64[::1],
+    int16[:, ::1],
+    int64,
+    int64,
+    int64,
+    int16[:, ::1],
+    uint64[:, ::1],
 )
+
+
+@njit(nogil=True,
+    cache=False)
 def refresh_side(
     state: np.ndarray,
     accumulator: np.ndarray,
@@ -345,9 +369,10 @@ def refresh_side(
     return 0
 
 
-@njit(
-    int64(uint64[::1], int16[:, ::1], int16[:, ::1], uint64[:, ::1]), nogil=True, cache=False
-)
+_SIG_refresh = int64(uint64[::1], int16[:, ::1], int16[:, ::1], uint64[:, ::1])
+
+
+@njit(nogil=True, cache=False)
 def refresh(
     state: np.ndarray,
     accumulator: np.ndarray,
@@ -362,11 +387,18 @@ def refresh(
     return 0
 
 
-@njit(
-    int64(uint64[::1], uint64[::1], int16[:, ::1], int16[:, ::1], int16[:, ::1], uint64[:, ::1]),
-    nogil=True,
-    cache=False,
+_SIG_advance = int64(
+    uint64[::1],
+    uint64[::1],
+    int16[:, ::1],
+    int16[:, ::1],
+    int16[:, ::1],
+    uint64[:, ::1],
 )
+
+
+@njit(nogil=True,
+    cache=False)
 def advance(
     before: np.ndarray,
     after: np.ndarray,
@@ -485,7 +517,10 @@ def advance(
     return 0
 
 
-@njit(int32(int16[:, ::1], int64, int64), nogil=True, cache=False)
+_SIG_forward = int32(int16[:, ::1], int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def forward(accumulator: np.ndarray, side_to_move: np.int64, bucket: np.int64) -> np.int32:
     """Clipped ReLU and the output dot product in one pass, in centipawns.
 
@@ -518,7 +553,10 @@ def forward(accumulator: np.ndarray, side_to_move: np.int64, bucket: np.int64) -
     return np.int32(total * EVAL_SCALE // (QA * QB))
 
 
-@njit(int64(uint64[::1], int32[::1], int32[::1]), nogil=True, cache=False)
+_SIG_features = int64(uint64[::1], int32[::1], int32[::1])
+
+
+@njit(nogil=True, cache=False)
 def features(state: np.ndarray, white: np.ndarray, black: np.ndarray) -> np.int64:
     """The active feature indices for both perspectives, and how many there are.
 
@@ -550,3 +588,30 @@ def new_cache() -> tuple[np.ndarray, np.ndarray]:
     values = np.ascontiguousarray(np.tile(BIASES, (CACHE_SLOTS, 1)))
     boards = np.zeros((CACHE_SLOTS, 12), dtype=np.uint64)
     return values, boards
+
+
+_COMPILE_PAIRS = (
+    (output_bucket, _SIG_output_bucket),
+    (perspective, _SIG_perspective),
+    (_index, _SIG__index),
+    (_apply, _SIG__apply),
+    (_slot, _SIG__slot),
+    (refresh_side, _SIG_refresh_side),
+    (refresh, _SIG_refresh),
+    (advance, _SIG_advance),
+    (forward, _SIG_forward),
+    (features, _SIG_features),
+)
+
+
+def _compile_all(deadline: float | None = None) -> bool:
+    """Compile this module's functions, stopping if `deadline` has passed.
+
+    Returns whether it finished. Ordered so the cheap functions land first: whatever
+    the init budget can afford does not have to be paid out of the first move's clock.
+    """
+    for fn, sig in _COMPILE_PAIRS:
+        if deadline is not None and time.monotonic() > deadline:
+            return False
+        fn.compile(sig)
+    return True

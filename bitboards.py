@@ -12,6 +12,8 @@ Bitboards are uint64 throughout. numba follows numpy promotion rules, so mixing 
 an untyped Python literal yields a float. Every literal in jitted code is wrapped accordingly.
 """
 
+import time
+
 import numpy as np
 from numba import int64, njit, uint64
 
@@ -123,7 +125,10 @@ for _i in range(64):
     DEBRUIJN_INDEX[(((1 << _i) * _DEBRUIJN) & MASK64) >> 58] = _i
 
 
-@njit(int64(uint64), nogil=True, cache=False, inline="always")
+_SIG_popcount = int64(uint64)
+
+
+@njit(nogil=True, cache=False)
 def popcount(board: np.uint64) -> np.int64:
     x = board
     x = x - ((x >> np.uint64(1)) & np.uint64(0x5555_5555_5555_5555))
@@ -134,14 +139,20 @@ def popcount(board: np.uint64) -> np.int64:
     return np.int64((x * np.uint64(0x0101_0101_0101_0101)) >> np.uint64(56))
 
 
-@njit(int64(uint64), nogil=True, cache=False, inline="always")
+_SIG_lsb = int64(uint64)
+
+
+@njit(nogil=True, cache=False)
 def lsb(board: np.uint64) -> np.int64:
     """Index of the lowest set bit. Undefined for an empty board, never called with one."""
     isolated = board & (~board + U1)
     return DEBRUIJN_INDEX[np.int64((isolated * DEBRUIJN) >> np.uint64(58))]
 
 
-@njit(uint64(uint64[:]), nogil=True, cache=False)
+_SIG__random = uint64(uint64[:])
+
+
+@njit(nogil=True, cache=False)
 def _random(state: np.ndarray) -> np.uint64:
     x = state[0]
     x ^= x << np.uint64(13)
@@ -151,7 +162,10 @@ def _random(state: np.ndarray) -> np.uint64:
     return x
 
 
-@njit(uint64(uint64, uint64[:], uint64[:], int64, uint64[:]), nogil=True, cache=False)
+_SIG__find_magic = uint64(uint64, uint64[:], uint64[:], int64, uint64[:])
+
+
+@njit(nogil=True, cache=False)
 def _find_magic(
     mask: np.uint64,
     occupancies: np.ndarray,
@@ -215,19 +229,28 @@ ROOK_MAGIC, ROOK_TABLE = _build_magics(ROOK_MASK, ROOK_BITS, ROOK_DELTAS, 1 << 1
 BISHOP_MAGIC, BISHOP_TABLE = _build_magics(BISHOP_MASK, BISHOP_BITS, BISHOP_DELTAS, 1 << 9)
 
 
-@njit(uint64(int64, uint64), nogil=True, cache=False, inline="always")
+_SIG_rook_attacks = uint64(int64, uint64)
+
+
+@njit(nogil=True, cache=False)
 def rook_attacks(square: np.int64, occupied: np.uint64) -> np.uint64:
     index = ((occupied & ROOK_MASK[square]) * ROOK_MAGIC[square]) >> ROOK_SHIFT[square]
     return ROOK_TABLE[square, np.int64(index)]
 
 
-@njit(uint64(int64, uint64), nogil=True, cache=False, inline="always")
+_SIG_bishop_attacks = uint64(int64, uint64)
+
+
+@njit(nogil=True, cache=False)
 def bishop_attacks(square: np.int64, occupied: np.uint64) -> np.uint64:
     index = ((occupied & BISHOP_MASK[square]) * BISHOP_MAGIC[square]) >> BISHOP_SHIFT[square]
     return BISHOP_TABLE[square, np.int64(index)]
 
 
-@njit(uint64(int64, uint64), nogil=True, cache=False, inline="always")
+_SIG_queen_attacks = uint64(int64, uint64)
+
+
+@njit(nogil=True, cache=False)
 def queen_attacks(square: np.int64, occupied: np.uint64) -> np.uint64:
     return rook_attacks(square, occupied) | bishop_attacks(square, occupied)
 
@@ -239,3 +262,27 @@ ZOBRIST_PIECE = np.ascontiguousarray(_zobrist[: 12 * 64].reshape(12, 64))
 ZOBRIST_CASTLE = np.ascontiguousarray(_zobrist[12 * 64 : 12 * 64 + 16])
 ZOBRIST_EP = np.ascontiguousarray(_zobrist[12 * 64 + 16 : 12 * 64 + 24])
 ZOBRIST_SIDE = np.uint64(_zobrist[-1])
+
+
+_COMPILE_PAIRS = (
+    (popcount, _SIG_popcount),
+    (lsb, _SIG_lsb),
+    (_random, _SIG__random),
+    (_find_magic, _SIG__find_magic),
+    (rook_attacks, _SIG_rook_attacks),
+    (bishop_attacks, _SIG_bishop_attacks),
+    (queen_attacks, _SIG_queen_attacks),
+)
+
+
+def _compile_all(deadline: float | None = None) -> bool:
+    """Compile this module's functions, stopping if `deadline` has passed.
+
+    Returns whether it finished. Ordered so the cheap functions land first: whatever
+    the init budget can afford does not have to be paid out of the first move's clock.
+    """
+    for fn, sig in _COMPILE_PAIRS:
+        if deadline is not None and time.monotonic() > deadline:
+            return False
+        fn.compile(sig)
+    return True

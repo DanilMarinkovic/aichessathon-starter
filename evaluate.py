@@ -8,6 +8,8 @@ that correctly hides on g1 in the opening still hides there in a king-and-pawn e
 it should be marching up the board.
 """
 
+import time
+
 import numpy as np
 from numba import int64, njit, uint64
 
@@ -204,7 +206,10 @@ MOBILITY_EG = np.array([0, 0, 4, 5, 4, 2, 0], dtype=np.int64)
 KING_ATTACK_WEIGHT = np.array([0, 0, 2, 2, 3, 5, 0], dtype=np.int64)
 
 
-@njit(int64(uint64[::1]), nogil=True, cache=False)
+_SIG_evaluate = int64(uint64[::1])
+
+
+@njit(nogil=True, cache=False)
 def evaluate(state: np.ndarray) -> np.int64:
     middlegame = 0
     endgame = 0
@@ -298,3 +303,21 @@ def evaluate(state: np.ndarray) -> np.int64:
     if np.int64(state[SIDE]) != WHITE:
         score = -score
     return score + TEMPO
+
+
+_COMPILE_PAIRS = (
+    (evaluate, _SIG_evaluate),
+)
+
+
+def _compile_all(deadline: float | None = None) -> bool:
+    """Compile this module's functions, stopping if `deadline` has passed.
+
+    Returns whether it finished. Ordered so the cheap functions land first: whatever
+    the init budget can afford does not have to be paid out of the first move's clock.
+    """
+    for fn, sig in _COMPILE_PAIRS:
+        if deadline is not None and time.monotonic() > deadline:
+            return False
+        fn.compile(sig)
+    return True

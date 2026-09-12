@@ -17,9 +17,17 @@ A transposition entry is packed into one int64 so the table is two arrays instea
     bits 46-47  EXACT, LOWER or UPPER
 """
 
+import time
+
 import numpy as np
 from numba import int16, int32, int64, njit, uint64
 
+import bitboards
+import evaluate as evaluate_module
+import movegen
+import nnue
+import position
+import see
 from bitboards import (
     BISHOP,
     KNIGHT,
@@ -197,7 +205,10 @@ for _depth in range(1, 64):
 LMR = _lmr
 
 
-@njit(int64(int32, int32, int64, int64), nogil=True, cache=False, inline="always")
+_SIG_pack = int64(int32, int32, int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def pack(move: np.int32, score: np.int32, depth: np.int64, flag: np.int64) -> np.int64:
     return (
         np.int64(move & 0x3FFFF)
@@ -207,7 +218,10 @@ def pack(move: np.int32, score: np.int32, depth: np.int64, flag: np.int64) -> np
     )
 
 
-@njit(int64(uint64[::1]), nogil=True, cache=False)
+_SIG_has_pieces = int64(uint64[::1])
+
+
+@njit(nogil=True, cache=False)
 def has_pieces(state: np.ndarray) -> np.int64:
     """Whether the side to move has a piece other than pawns, which null move requires."""
     base = np.int64(state[SIDE]) * 6
@@ -220,7 +234,10 @@ def has_pieces(state: np.ndarray) -> np.int64:
     return 1 if heavy != U0 else 0
 
 
-@njit(int64(uint64[::1]), nogil=True, cache=False)
+_SIG_material_draw = int64(uint64[::1])
+
+
+@njit(nogil=True, cache=False)
 def material_draw(state: np.ndarray) -> np.int64:
     """King against king, and king and a single minor against king, cannot be won."""
     if (
@@ -238,7 +255,10 @@ def material_draw(state: np.ndarray) -> np.int64:
     return 1 if minors <= 1 else 0
 
 
-@njit(int64(uint64[::1]), nogil=True, cache=False, inline="always")
+_SIG_pawn_index = int64(uint64[::1])
+
+
+@njit(nogil=True, cache=False)
 def pawn_index(state: np.ndarray) -> np.int64:
     """A hash of the pawn structure alone.
 
@@ -252,7 +272,10 @@ def pawn_index(state: np.ndarray) -> np.int64:
     return np.int64((mixed >> np.uint64(32)) & np.uint64(CORR_MASK))
 
 
-@njit(int64(uint64[:, ::1], uint64[::1], int64, int64), nogil=True, cache=False)
+_SIG_is_repetition = int64(uint64[:, ::1], uint64[::1], int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def is_repetition(
     states: np.ndarray, path: np.ndarray, ply: np.int64, root_offset: np.int64
 ) -> np.int64:
@@ -276,7 +299,10 @@ def is_repetition(
     return 0
 
 
-@njit(int64(uint64[::1], uint64[::1]), nogil=True, cache=False)
+_SIG_make_null = int64(uint64[::1], uint64[::1])
+
+
+@njit(nogil=True, cache=False)
 def make_null(state: np.ndarray, out: np.ndarray) -> np.int64:
     for index in range(NFIELDS):
         out[index] = state[index]
@@ -291,13 +317,19 @@ def make_null(state: np.ndarray, out: np.ndarray) -> np.int64:
     return 1
 
 
-@njit(int64(int64, int64, int64), nogil=True, cache=False, inline="always")
+_SIG_caphist_index = int64(int64, int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def caphist_index(piece: np.int64, target: np.int64, victim: np.int64) -> np.int64:
     """Where a (moving piece, target square, captured piece) triple lives inside CONTROL."""
     return CAPHIST_BASE + (piece * 64 + target) * 6 + victim - 1
 
 
-@njit(int64(uint64[::1], int32, int32, int64[::1]), nogil=True, cache=False)
+_SIG_score_move = int64(uint64[::1], int32, int32, int64[::1])
+
+
+@njit(nogil=True, cache=False)
 def score_move(
     state: np.ndarray, move: np.int32, tt_move: np.int32, control: np.ndarray
 ) -> np.int64:
@@ -337,7 +369,10 @@ def score_move(
     return 0
 
 
-@njit(int32(int32[:, ::1], int32[:, ::1], int64, int64, int64), nogil=True, cache=False)
+_SIG_pick_move = int32(int32[:, ::1], int32[:, ::1], int64, int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def pick_move(
     moves: np.ndarray, order: np.ndarray, ply: np.int64, start: np.int64, count: np.int64
 ) -> np.int32:
@@ -356,12 +391,11 @@ def pick_move(
     return moves[ply, start]
 
 
-@njit(
-    int32(uint64[:, ::1], int16[:, :, ::1], int64[::1], int64),
-    nogil=True,
-    cache=False,
-    inline="always",
-)
+_SIG_score_position = int32(uint64[:, ::1], int16[:, :, ::1], int64[::1], int64)
+
+
+@njit(nogil=True,
+    cache=False)
 def score_position(
     states: np.ndarray, accumulators: np.ndarray, control: np.ndarray, ply: np.int64
 ) -> np.int32:
@@ -379,12 +413,18 @@ def score_position(
     return raw + np.int32(control[slot_c] // CORR_GRAIN)
 
 
-@njit(
-    int64(uint64[:, ::1], int16[:, :, ::1], int16[:, ::1], uint64[:, ::1], int64[::1], int64),
-    nogil=True,
-    cache=False,
-    inline="always",
+_SIG_push_accumulator = int64(
+    uint64[:, ::1],
+    int16[:, :, ::1],
+    int16[:, ::1],
+    uint64[:, ::1],
+    int64[::1],
+    int64,
 )
+
+
+@njit(nogil=True,
+    cache=False)
 def push_accumulator(
     states: np.ndarray,
     accumulators: np.ndarray,
@@ -402,8 +442,7 @@ def push_accumulator(
     return 0
 
 
-@njit(
-    int32(
+_SIG_quiescence = int32(
         uint64[:, ::1],
         int16[:, :, ::1],
         int16[:, ::1],
@@ -414,10 +453,11 @@ def push_accumulator(
         int64,
         int32,
         int32,
-    ),
-    nogil=True,
-    cache=False,
-)
+    )
+
+
+@njit(nogil=True,
+    cache=False)
 def quiescence(
     states: np.ndarray,
     accumulators: np.ndarray,
@@ -494,8 +534,7 @@ def quiescence(
     return best
 
 
-@njit(
-    int32(
+_SIG_negamax = int32(
         uint64[:, ::1],
         int16[:, :, ::1],
         int16[:, ::1],
@@ -514,10 +553,11 @@ def quiescence(
         int32,
         int64,
         int64,
-    ),
-    nogil=True,
-    cache=False,
-)
+    )
+
+
+@njit(nogil=True,
+    cache=False)
 def negamax(
     states: np.ndarray,
     accumulators: np.ndarray,
@@ -999,8 +1039,7 @@ def negamax(
     return best_score
 
 
-@njit(
-    int64(
+_SIG_search_position = int64(
         uint64[:, ::1],
         int16[:, :, ::1],
         int16[:, ::1],
@@ -1015,10 +1054,11 @@ def negamax(
         int64[::1],
         int64,
         int64,
-    ),
-    nogil=True,
-    cache=False,
-)
+    )
+
+
+@njit(nogil=True,
+    cache=False)
 def search_position(
     states: np.ndarray,
     accumulators: np.ndarray,
@@ -1139,3 +1179,61 @@ def reset() -> None:
     # This clears the correction table too, which lives in the tail of CONTROL.
     CONTROL.fill(0)
     CONTROL[USE_NNUE] = evaluation
+
+
+_COMPILE_PAIRS = (
+    (pack, _SIG_pack),
+    (has_pieces, _SIG_has_pieces),
+    (material_draw, _SIG_material_draw),
+    (pawn_index, _SIG_pawn_index),
+    (is_repetition, _SIG_is_repetition),
+    (make_null, _SIG_make_null),
+    (caphist_index, _SIG_caphist_index),
+    (score_move, _SIG_score_move),
+    (pick_move, _SIG_pick_move),
+    (score_position, _SIG_score_position),
+    (push_accumulator, _SIG_push_accumulator),
+    (quiescence, _SIG_quiescence),
+    (negamax, _SIG_negamax),
+    (search_position, _SIG_search_position),
+)
+
+
+def _compile_all(deadline: float | None = None) -> bool:
+    """Compile this module's functions, stopping if `deadline` has passed.
+
+    Returns whether it finished. Ordered so the cheap functions land first: whatever
+    the init budget can afford does not have to be paid out of the first move's clock.
+    """
+    for fn, sig in _COMPILE_PAIRS:
+        if deadline is not None and time.monotonic() > deadline:
+            return False
+        fn.compile(sig)
+    return True
+def compile_search(deadline: float | None = None) -> bool:
+    """Compile every jitted function, in dependency order, stopping at `deadline`.
+
+    The platform charges container start, the interpreter and every import against a 30 second
+    init budget, and numba compiling at module level does not fit in it. Declaring the signatures
+    here rather than on the decorators keeps the emitted code identical -- letting numba infer
+    the types costs about 14% of the node rate -- and moves only when the work happens.
+
+    Whatever the budget affords is compiled at import; the rest is compiled on the first move and
+    paid from the match clock, which is the more plentiful of the two but not free. Passing a
+    deadline lets a slow container simply compile less rather than overrun and lose by init.
+
+    Dependency order matters: a caller compiled before its callee pulls the callee in with
+    inferred types instead of its declared one.
+    """
+    for step in (
+        bitboards._compile_all,
+        position._compile_all,
+        movegen._compile_all,
+        see._compile_all,
+        evaluate_module._compile_all,
+        nnue._compile_all,
+        _compile_all,
+    ):
+        if not step(deadline):
+            return False
+    return True

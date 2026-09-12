@@ -22,6 +22,8 @@ A move is packed into an int32:
     bits 15-17  NORMAL, DOUBLE_PUSH, EN_PASSANT or CASTLE
 """
 
+import time
+
 import chess
 import numpy as np
 from numba import int32, int64, njit, uint64
@@ -79,32 +81,50 @@ _CASTLE_MASK[A8] = 0b0111
 CASTLE_MASK = _CASTLE_MASK
 
 
-@njit(int32(int64, int64, int64, int64), nogil=True, cache=False, inline="always")
+_SIG_encode = int32(int64, int64, int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def encode(origin: np.int64, target: np.int64, promotion: np.int64, flag: np.int64) -> np.int32:
     return np.int32(origin | (target << 6) | (promotion << 12) | (flag << 15))
 
 
-@njit(int64(int32), nogil=True, cache=False, inline="always")
+_SIG_move_from = int64(int32)
+
+
+@njit(nogil=True, cache=False)
 def move_from(move: np.int32) -> np.int64:
     return np.int64(move & 63)
 
 
-@njit(int64(int32), nogil=True, cache=False, inline="always")
+_SIG_move_to = int64(int32)
+
+
+@njit(nogil=True, cache=False)
 def move_to(move: np.int32) -> np.int64:
     return np.int64((move >> 6) & 63)
 
 
-@njit(int64(int32), nogil=True, cache=False, inline="always")
+_SIG_move_promotion = int64(int32)
+
+
+@njit(nogil=True, cache=False)
 def move_promotion(move: np.int32) -> np.int64:
     return np.int64((move >> 12) & 7)
 
 
-@njit(int64(int32), nogil=True, cache=False, inline="always")
+_SIG_move_flag = int64(int32)
+
+
+@njit(nogil=True, cache=False)
 def move_flag(move: np.int32) -> np.int64:
     return np.int64((move >> 15) & 7)
 
 
-@njit(int64(uint64[::1], int64, int64), nogil=True, cache=False)
+_SIG_piece_on = int64(uint64[::1], int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def piece_on(state: np.ndarray, square: np.int64, colour: np.int64) -> np.int64:
     """The piece type a colour has on a square, or 0 when it has none."""
     board = U1 << np.uint64(square)
@@ -115,7 +135,10 @@ def piece_on(state: np.ndarray, square: np.int64, colour: np.int64) -> np.int64:
     return 0
 
 
-@njit(int64(uint64[::1], int64, int64), nogil=True, cache=False)
+_SIG_is_attacked = int64(uint64[::1], int64, int64)
+
+
+@njit(nogil=True, cache=False)
 def is_attacked(state: np.ndarray, square: np.int64, by: np.int64) -> np.int64:
     """Whether `by` attacks a square. Used for legality, castling and check detection."""
     base = by * 6
@@ -135,14 +158,20 @@ def is_attacked(state: np.ndarray, square: np.int64, by: np.int64) -> np.int64:
     return 0
 
 
-@njit(int64(uint64[::1]), nogil=True, cache=False)
+_SIG_in_check = int64(uint64[::1])
+
+
+@njit(nogil=True, cache=False)
 def in_check(state: np.ndarray) -> np.int64:
     side = np.int64(state[SIDE])
     king = lsb(state[side * 6 + KING - 1])
     return is_attacked(state, king, 1 - side)
 
 
-@njit(int64(uint64[::1], int32, uint64[::1]), nogil=True, cache=False)
+_SIG_make_move = int64(uint64[::1], int32, uint64[::1])
+
+
+@njit(nogil=True, cache=False)
 def make_move(state: np.ndarray, move: np.int32, out: np.ndarray) -> np.int64:
     """Play a pseudo-legal move into `out`. Returns 0 if it left the mover's king in check.
 
@@ -245,7 +274,10 @@ def make_move(state: np.ndarray, move: np.int32, out: np.ndarray) -> np.int64:
     return 1
 
 
-@njit(uint64(uint64[::1]), nogil=True, cache=False)
+_SIG_compute_hash = uint64(uint64[::1])
+
+
+@njit(nogil=True, cache=False)
 def compute_hash(state: np.ndarray) -> np.uint64:
     """Recompute the Zobrist key from scratch. Only used to check the incremental one."""
     key = U0
@@ -312,3 +344,30 @@ def to_uci(move: int) -> str:
     if promotion:
         text += chess.piece_symbol(_PIECE_ORDER[promotion - 1]) or ""
     return text
+
+
+_COMPILE_PAIRS = (
+    (encode, _SIG_encode),
+    (move_from, _SIG_move_from),
+    (move_to, _SIG_move_to),
+    (move_promotion, _SIG_move_promotion),
+    (move_flag, _SIG_move_flag),
+    (piece_on, _SIG_piece_on),
+    (is_attacked, _SIG_is_attacked),
+    (in_check, _SIG_in_check),
+    (make_move, _SIG_make_move),
+    (compute_hash, _SIG_compute_hash),
+)
+
+
+def _compile_all(deadline: float | None = None) -> bool:
+    """Compile this module's functions, stopping if `deadline` has passed.
+
+    Returns whether it finished. Ordered so the cheap functions land first: whatever
+    the init budget can afford does not have to be paid out of the first move's clock.
+    """
+    for fn, sig in _COMPILE_PAIRS:
+        if deadline is not None and time.monotonic() > deadline:
+            return False
+        fn.compile(sig)
+    return True
