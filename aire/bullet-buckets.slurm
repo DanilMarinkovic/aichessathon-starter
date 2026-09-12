@@ -117,7 +117,14 @@ if [ -n "${TARGET_SAMPLES:-}" ]; then
   [ "$EPOCHS" -lt 1 ] && EPOCHS=1
   echo "TARGET_SAMPLES=$TARGET_SAMPLES over $POSITIONS positions -> $EPOCHS superbatches"
 fi
-echo "training on $POSITIONS positions, held-out set $(( $(stat -c %s "$TEST_BINARY") / 32 ))"
+# BINARY may be absolute -- large datasets live on $SCRATCH, not under the repository, because
+# /users gives 66GB and $SCRATCH gives a terabyte. Prepending $ORIGIN to an absolute path
+# produces /users/.../aichessathon-starter//mnt/scratch/... and the loader fails with a bare
+# "No such file or directory" three seconds in, having said nothing about which file.
+case "$BINARY" in /*) DATA_PATH="$BINARY" ;; *) DATA_PATH="$ORIGIN/$BINARY" ;; esac
+case "$TEST_BINARY" in /*) TEST_PATH="$TEST_BINARY" ;; *) TEST_PATH="$ORIGIN/$TEST_BINARY" ;; esac
+[ -s "$DATA_PATH" ] || { echo "ERROR: $DATA_PATH is missing or empty" >&2; exit 1; }
+echo "training on $POSITIONS positions from $DATA_PATH"
 
 # Screening needs the candidate installed at weights/net.npz, the only network the engine will
 # load -- so it happens in a scratch copy of the repository, never in the repository itself.
@@ -158,8 +165,8 @@ for OB in $OUTPUTS; do
 
   ( cd aire/bullet-trainer
     HIDDEN="$HIDDEN" BUCKETS="$NBUCKETS" OUTPUT_BUCKETS="$OB" EPOCHS="$EPOCHS" \
-      POSITIONS="$POSITIONS" NET_ID="$NET_ID" DATA="$ORIGIN/$BINARY" \
-      TEST_DATA="$ORIGIN/$TEST_BINARY" THREADS="${SLURM_CPUS_PER_TASK:-8}" \
+      POSITIONS="$POSITIONS" NET_ID="$NET_ID" DATA="$DATA_PATH" \
+      TEST_DATA="$TEST_PATH" THREADS="${SLURM_CPUS_PER_TASK:-8}" \
       cargo run --release --features cuda )
 
   # Sort on the trailing superbatch number, not on "the second hyphen-separated field" -- the
@@ -184,6 +191,15 @@ for OB in $OUTPUTS; do
   KEEP="aire/data/${NET_ID}.npz"
   uv run python tools/from_bullet.py "$CHECKPOINT/raw.bin" \
     --buckets "$NBUCKETS" --output-buckets "$OB" --out "$KEEP"
+
+  # The intermediate checkpoints have done their job once the network is converted, and at
+  # this width they are enormous: 218MB each, eight per run. Sixteen runs of that filled a
+  # 65GB quota and killed three GPU jobs -- one of them after it had trained for an hour and
+  # was writing its output. Keep the last one, in case a resume is wanted, and drop the rest.
+  for spent in $(ls -d aire/bullet-trainer/checkpoints/"$NET_ID"-* 2>/dev/null \
+      | sed 's/.*-\([0-9][0-9]*\)$/\1 &/' | sort -k1,1n | head -n -1 | cut -d' ' -f2-); do
+    rm -rf "$spent"
+  done
 
   cp "$KEEP" "$SCRATCH/weights/net.npz"
   SUMMARY=$( cd "$SCRATCH" && uv run python tools/side_bias.py "$ORIGIN/$SCREEN" --limit 4000 \

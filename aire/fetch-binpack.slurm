@@ -33,7 +33,13 @@ mkdir -p aire/logs aire/data
 
 REPO=${REPO:-official-stockfish/master-binpacks}
 FILE=${FILE:-wrongIsRight_nodes5000pv2.binpack}
-DEST=aire/data/$FILE
+# $SCRATCH by default, not the home directory. /users gives us 66GB and $SCRATCH gives us a
+# terabyte on a shared Lustre filesystem that writes at 1.2GB/s -- and on 8 September a 66GB
+# quota filled by training checkpoints killed three GPU jobs, one of them after it had trained
+# for an hour. Nothing large has any business living under /users.
+DATADIR=${DATADIR:-${SCRATCH:-$PWD/aire/data}/data}
+mkdir -p "$DATADIR"
+DEST=$DATADIR/$FILE
 
 echo "quota before:"; quota -s | tail -1
 if [ -s "$DEST" ]; then echo "$DEST already present"; exit 0; fi

@@ -136,6 +136,16 @@ def main() -> None:
         f"{output_buckets} output buckets, {arguments.out.stat().st_size / 1e6:.1f} MB"
     )
     print(f"  trained for {superbatches} superbatches (from {arguments.raw.parent.name})")
+
+    # Read it back before claiming success. A .npz written while the filesystem is full comes
+    # out the right length with a bad CRC, and numpy only notices when something later tries to
+    # load an array from it. That happened on 8 September: a network trained for an hour was
+    # written under an exhausted quota, reported as written, and turned out to be unreadable
+    # only when a match tried to play it.
+    check = np.load(arguments.out)
+    for name in ("weights", "biases", "output", "output_bias"):
+        _ = check[name].shape
+    print("  verified readable")
     print("check it with: uv run python tests/check_nnue.py")
 
 

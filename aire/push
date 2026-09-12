@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Copy files to Aire down the SAME connection aire/sh uses.
+#
+#   bash aire/push nnue.py searcher.py
+#   bash aire/push --dir tools/
+#
+# rsync opens its own ssh connection and knows nothing about aire/sh's lock, so mixing the two
+# is how a careful session still ends up making a burst of connections. On 7 September that
+# burst arrived seconds after a block had aged out and, as far as we can tell, restarted it.
+# -e passes rsync the same ControlPath, so it rides the existing master instead of dialling.
+set -euo pipefail
+HOST=${AIRE_HOST:-aire}
+REMOTE=${AIRE_REMOTE:-aichessathon-starter}
+cd "$(dirname "$0")/.."
+
+# Ensure the master exists first, through the same lock aire/sh takes.
+bash aire/sh true
+
+if [ -t 0 ] || [ -t 1 ]; then BATCH=no; else BATCH=yes; fi
+RSH="ssh -o BatchMode=$BATCH -o ControlMaster=no -o ControlPath=$HOME/.ssh/cm-%r@%h:%p"
+# -R keeps each argument's relative path, so `aire/push aire/bullet-trainer/src/main.rs` lands
+# in aire/bullet-trainer/src/ and not in the repository root. Without it the file arrives in the
+# wrong place, the build finds nothing changed, and the run silently uses the old source.
+if [ "${1:-}" = "--dir" ]; then
+  shift
+  for d in "$@"; do rsync -az -e "$RSH" "${d%/}/" "$HOST:$REMOTE/${d%/}/"; done
+else
+  rsync -azR -e "$RSH" "$@" "$HOST:$REMOTE/"
+fi

@@ -210,23 +210,26 @@ fn train<const OUTPUT_BUCKETS: usize>() {
             end_superbatch: epochs,
         },
         wdl_scheduler: wdl::ConstantWDL { value: wdl_weight },
-        // Drop the rate once, two thirds of the way in. With single-digit epoch counts a
-        // step schedule that never fires is the same as a constant one, so the step is
-        // derived from the epoch count rather than hard coded at bullet's 18.
-        lr_scheduler: lr::StepLR { start: lr_start, gamma: 0.1, step: (epochs * 2 / 3).max(1) },
-        // Eight checkpoints, not one at the end.
+        // Cosine decay, not a single step two thirds of the way in.
         //
-        // bullet saves when `superbatch % save_rate == 0` or on the final superbatch, so
-        // `save_rate: epochs` writes exactly one checkpoint, after the last superbatch. On the
-        // gpu partition the wall limit is a SIGKILL, and a run that overruns by a minute then
-        // leaves nothing at all -- no weights to convert, no network to play, and the slot
-        // gone. It has already happened once, nine superbatches from the end of a 320
-        // superbatch schedule.
+        // The step schedule was inherited from a 393k-parameter network and kept when the
+        // network grew to 12.6M. Its loss curve says what that costs: sfbig fell to 0.01135 by
+        // superbatch 121, then sat between 0.01133 and 0.01138 for a hundred and sixty
+        // superbatches -- no improvement at all -- and dropped to 0.01107 the moment the rate
+        // finally stepped at 253. Roughly two fifths of the run was spent at a learning rate
+        // the network had already outgrown, waiting for a schedule written for a different
+        // network to notice.
         //
-        // A checkpoint is a few megabytes and takes well under a second, so the insurance is
-        // free: the worst case becomes losing the last eighth of the schedule rather than all
-        // of it. The slurm script already picks the highest-numbered checkpoint, so a partial
-        // run converts and screens exactly like a complete one.
+        // Cosine decay removes the plateau by construction: the rate is always falling, so the
+        // network is never parked at one it has outgrown. It is also what the nnue-pytorch
+        // schedules do rather than a single late step. CosineDecayLR holds final_lr beyond
+        // final_superbatch, so no Sequence wrapper is needed, and LR_FINAL stays overridable so
+        // this remains a measurement rather than a second inherited default.
+        lr_scheduler: lr::CosineDecayLR {
+            initial_lr: lr_start,
+            final_lr: env_or("LR_FINAL", lr_start / 100.0),
+            final_superbatch: epochs,
+        },
         save_rate: (epochs / 8).max(1),
     };
 

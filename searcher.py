@@ -137,7 +137,24 @@ ORDER = np.zeros((MAX_PLY + 8, MAX_MOVES), dtype=np.int32)
 KILLERS = np.zeros((MAX_PLY + 8, 2), dtype=np.int32)
 HISTORY = np.zeros((12, 64), dtype=np.int64)
 PATH = np.zeros(PATH_LIMIT + MAX_PLY + 8, dtype=np.uint64)
-CONTROL = np.zeros(CORR_BASE + 2 * CORR_SIZE, dtype=np.int64)
+# One slot per ply holding a move the search must pretend does not exist. Used by the singular
+# extension below, which asks "is this move the only good one here?" by searching the same node
+# again with that move removed. It lives in CONTROL for the same reason the correction table
+# does: numba freezes a global array into compiled code as read-only, so anything written during
+# a search has to be a parameter, and threading a seventh array through six recursive call sites
+# of otherwise identically typed arrays is the edit that goes wrong silently.
+EXCLUDED_BASE = CORR_BASE + 2 * CORR_SIZE
+
+# Capture history: a score per (moving piece, target square, captured piece), learned the way
+# the quiet history is. SEE already splits captures into winning and losing, which is a stronger
+# first cut than most-valuable-victim; this orders within those groups, where SEE says only "not
+# losing material" and cannot tell a good capture from a pointless one. Stefan Geschwentner
+# introduced it in 2016 and it is standard now, replacing least-valuable-attacker as the
+# tiebreak. It lives in CONTROL for the usual reason: numba freezes a global array into compiled
+# code read-only, so anything written during a search has to arrive as a parameter.
+CAPHIST_BASE = EXCLUDED_BASE + MAX_PLY + 8
+CAPHIST_SIZE = 12 * 64 * 6
+CONTROL = np.zeros(CAPHIST_BASE + CAPHIST_SIZE, dtype=np.int64)
 # The network is the evaluation whenever one is loaded. Set here, at import, and not left for
 # each caller: CONTROL is zeros, so the old default was the hand-crafted evaluation, and for
 # weeks every tool that drove the search itself -- tools/probe.py, tools/nodecost.py -- silently
@@ -274,8 +291,16 @@ def make_null(state: np.ndarray, out: np.ndarray) -> np.int64:
     return 1
 
 
-@njit(int64(uint64[::1], int32, int32), nogil=True, cache=False)
-def score_move(state: np.ndarray, move: np.int32, tt_move: np.int32) -> np.int64:
+@njit(int64(int64, int64, int64), nogil=True, cache=False, inline="always")
+def caphist_index(piece: np.int64, target: np.int64, victim: np.int64) -> np.int64:
+    """Where a (moving piece, target square, captured piece) triple lives inside CONTROL."""
+    return CAPHIST_BASE + (piece * 64 + target) * 6 + victim - 1
+
+
+@njit(int64(uint64[::1], int32, int32, int64[::1]), nogil=True, cache=False)
+def score_move(
+    state: np.ndarray, move: np.int32, tt_move: np.int32, control: np.ndarray
+) -> np.int64:
     """Order moves so alpha-beta sees the good ones first, which is most of its value."""
     if move == tt_move:
         return 2_000_000
@@ -283,10 +308,27 @@ def score_move(state: np.ndarray, move: np.int32, tt_move: np.int32) -> np.int64
     victim = PAWN if move_flag(move) == EN_PASSANT else piece_on(state, move_to(move), 1 - side)
     if victim != 0:
         attacker = piece_on(state, move_from(move), side)
-        rank = PIECE_VALUE[victim] * 16 - PIECE_VALUE[attacker]
+        # The victim still dominates the order; capture history replaces the attacker as the
+        # tiebreak, divided so a saturated entry is worth about a pawn of victim value and no
+        # more -- enough to reorder captures of equal material, never enough to put a capture
+        # of a pawn above a capture of a rook.
+        learned = control[caphist_index(
+            side * 6 + attacker - 1, np.int64(move_to(move)), np.int64(victim)
+        )]
+        rank = PIECE_VALUE[victim] * 16 - PIECE_VALUE[attacker] + learned // 64
         # Most valuable victim first is a good guess and a bad answer: it rates a pawn taking a
         # defended queen above a clean win of a rook. SEE separates the two, and losing captures
         # drop below the quiet moves rather than being tried first.
+        # SEE is not free, and for most captures its answer is already known. The capturing
+        # side can always stop after the first capture, so the exchange is worth at least
+        # victim - attacker; when the victim is worth at least as much as the attacker that
+        # lower bound is already non-negative and see_ge(move, 0) cannot come back false.
+        # Skipping the call there is exact, not an approximation, and it covers pawn takes
+        # anything, knight takes rook, rook takes queen and every equal trade -- which is most
+        # of the captures in a normal position, all ordered before a cutoff that often arrives
+        # on the first move.
+        if PIECE_VALUE[victim] >= PIECE_VALUE[attacker]:
+            return 1_000_000 + rank
         if see_ge(state, move, np.int64(0)) != 0:
             return 1_000_000 + rank
         return 100_000 + rank
@@ -407,7 +449,9 @@ def quiescence(
     count = generate(states[ply], moves[ply], 1)
     side = np.int64(states[ply, SIDE])
     for index in range(count):
-        order[ply, index] = np.int32(score_move(states[ply], moves[ply, index], np.int32(0)))
+        order[ply, index] = np.int32(
+            score_move(states[ply], moves[ply, index], np.int32(0), control)
+        )
 
     best = stand_pat
     for index in range(count):
@@ -529,14 +573,26 @@ def negamax(
         ply, alpha, beta,
     )
 
+    excluded = np.int32(control[EXCLUDED_BASE + ply])
+
     key = states[ply, HASH]
     slot = np.int64(key & TT_MASK)
     tt_move = np.int32(0)
+    tt_value = np.int32(0)
+    tt_flag = np.int64(-1)
+    tt_depth = np.int64(0)
     if tt_key[slot] == key:
         entry = tt_data[slot]
         tt_move = np.int32(entry & 0x3FFFF)
         stored_depth = (entry >> 38) & 0xFF
-        if not root and stored_depth >= depth:
+        tt_depth = np.int64(stored_depth)
+        tt_flag = np.int64((entry >> 46) & 3)
+        tt_value = np.int32(((entry >> 18) & 0xFFFFF) - SCORE_OFFSET)
+        if tt_value > MATE_THRESHOLD:
+            tt_value -= np.int32(ply)
+        elif tt_value < -MATE_THRESHOLD:
+            tt_value += np.int32(ply)
+        if not root and excluded == 0 and stored_depth >= depth:
             stored = np.int32(((entry >> 18) & 0xFFFFF) - SCORE_OFFSET)
             if stored > MATE_THRESHOLD:
                 stored -= np.int32(ply)
@@ -549,6 +605,14 @@ def negamax(
                 return stored
             if flag == UPPER and stored <= alpha:
                 return stored
+
+    # Internal iterative reduction: a node the table has never stored a move for is one no
+    # earlier search thought worth finishing, so spend a ply less on it. Cheaper than the
+    # internal iterative *deepening* it replaced, which searched the node twice to find a move
+    # to order by; this simply admits the node is probably not important. Stockfish applies it
+    # from depth 6, which is also where the cost of being wrong stops being trivial.
+    if depth >= 6 and tt_move == 0:
+        depth -= 1
 
     pv_node = beta - alpha > 1
     static = np.int32(0) if checked != 0 else score_position(states, accumulators, control, ply)
@@ -578,20 +642,46 @@ def negamax(
 
     count = generate(states[ply], moves[ply], 0)
     side = np.int64(states[ply, SIDE])
-    for index in range(count):
-        move = moves[ply, index]
-        rank = score_move(states[ply], move, tt_move)
-        if rank == 0:
-            if move == killers[ply, 0]:
-                rank = 800_000
-            elif move == killers[ply, 1]:
-                rank = 700_000
-            else:
-                piece = side * 6 + piece_on(states[ply], move_from(move), side) - 1
-                # Bounded to +/-MAX_HISTORY by the gravity update, so quiet moves always sort
-                # below the killers above and the captures scored in score_move.
-                rank = history[piece, move_to(move)]
-        order[ply, index] = np.int32(rank)
+
+    # Score the table's move first and nothing else, until something needs the rest.
+    #
+    # Ordering is the most expensive thing a node does. Measured at 512 wide: generating the
+    # moves costs 66ns, checking for check 9ns, making a move 30ns, the whole network 239ns --
+    # and scoring the move list 461ns, because every move costs two or three bitboard scans to
+    # find what it captures and what is moving. Most nodes with a table move never look past
+    # it, so nearly all of that is spent on moves that are never searched.
+    #
+    # So: find the table's move, rank it, leave the rest at zero, and only score them if the
+    # first move fails to cut. If the table's move is not in the list -- a key collision -- fall
+    # through to scoring everything, because picking arbitrarily would cost more in a worse
+    # first move than the scoring saves.
+    scored = False
+    tt_index = np.int64(-1)
+    if tt_move != 0:
+        for index in range(count):
+            if moves[ply, index] == tt_move:
+                tt_index = index
+                break
+    if tt_index >= 0:
+        for index in range(count):
+            order[ply, index] = np.int32(0)
+        order[ply, tt_index] = np.int32(2_000_000)
+    else:
+        for index in range(count):
+            move = moves[ply, index]
+            rank = score_move(states[ply], move, tt_move, control)
+            if rank == 0:
+                if move == killers[ply, 0]:
+                    rank = 800_000
+                elif move == killers[ply, 1]:
+                    rank = 700_000
+                else:
+                    piece = side * 6 + piece_on(states[ply], move_from(move), side) - 1
+                    # Bounded to +/-MAX_HISTORY by the gravity update, so quiet moves always
+                    # sort below the killers above and the captures scored in score_move.
+                    rank = history[piece, move_to(move)]
+            order[ply, index] = np.int32(rank)
+        scored = True
 
     best_score = np.int32(-INFINITY)
     best_move = np.int32(0)
@@ -599,7 +689,25 @@ def negamax(
     original_alpha = alpha
 
     for index in range(count):
+        # The table's move did not cut. Everything else has to be ordered properly now.
+        if not scored and index == 1:
+            for later in range(1, count):
+                move = moves[ply, later]
+                rank = score_move(states[ply], move, tt_move, control)
+                if rank == 0:
+                    if move == killers[ply, 0]:
+                        rank = 800_000
+                    elif move == killers[ply, 1]:
+                        rank = 700_000
+                    else:
+                        piece = side * 6 + piece_on(states[ply], move_from(move), side) - 1
+                        rank = history[piece, move_to(move)]
+                order[ply, later] = np.int32(rank)
+            scored = True
+
         move = pick_move(moves, order, ply, index, count)
+        if move == excluded:
+            continue
         quiet = (
             move_promotion(move) == 0
             and move_flag(move) != EN_PASSANT
@@ -623,6 +731,72 @@ def negamax(
         ):
             continue
 
+        # SEE pruning for quiet moves, which we have never done.
+        #
+        # A quiet move that hangs a piece is worth searching when the compensation is in the
+        # subtree, and less and less worth it the shallower the search that follows. Stockfish
+        # prunes on `see_ge(move, -23 * lmrDepth * lmrDepth)`, quadratic because the reduced
+        # depth is what decides whether the subtree can pay the material back, and lmrDepth --
+        # depth minus the reduction this move is about to get -- is the depth that actually
+        # follows it. This is not late move pruning, which counts moves and measured -23 Elo
+        # here: it prunes on what a move gives away, not on where it sits in the order.
+        if (
+            not pv_node
+            and checked == 0
+            and played > 0
+            and best_score > -MATE_THRESHOLD
+            and quiet
+            and move_promotion(move) == 0
+        ):
+            lmr_depth = depth - LMR[min(depth, 63), min(played, 63)]
+            if lmr_depth < 0:
+                lmr_depth = 0
+            if lmr_depth <= 8 and see_ge(
+                states[ply], move, np.int64(-23) * lmr_depth * lmr_depth
+            ) == 0:
+                continue
+
+        # Singular extension: is this the only move holding the position together?
+        #
+        # The table says this move was good enough to fail high here. If every other move,
+        # searched to half depth against a window a little below that score, fails low, the
+        # position rests on this one move -- which is what a forcing sequence is, and forcing
+        # sequences are exactly where our evaluation is least reliable. A ply spent there is
+        # worth more than a ply spent anywhere else.
+        #
+        # Conditions follow Stockfish: not the root, the move is the table's move, we are not
+        # already inside a verification, depth at least six, and the entry is a lower bound
+        # with depth within three of ours and a score that is not a mate. The margin is a small
+        # multiple of depth, inside the range Stockfish's own formula spans.
+        #
+        # The verification re-searches this node with the move removed through CONTROL. It
+        # cannot recurse, because the whole block is skipped whenever `excluded` is set.
+        extension = np.int64(0)
+        if (
+            not root
+            and excluded == 0
+            and move == tt_move
+            and depth >= 6
+            and tt_flag == LOWER
+            and tt_depth >= depth - 3
+            and abs(tt_value) < MATE_THRESHOLD
+        ):
+            singular_beta = np.int32(tt_value - np.int32(2 * depth))
+            control[EXCLUDED_BASE + ply] = np.int64(move)
+            verify = negamax(
+                states, accumulators, cache_values, cache_boards,
+                moves, order, killers, history,
+                tt_key, tt_data, path, control,
+                ply, (depth - 1) // 2,
+                np.int32(singular_beta - 1), singular_beta, root_offset, 0,
+            )
+            control[EXCLUDED_BASE + ply] = 0
+            if control[STOP] != 0:
+                return np.int32(0)
+            if verify < singular_beta:
+                extension = np.int64(1)
+        new_depth = depth - 1 + extension
+
         if make_move(states[ply], move, states[ply + 1]) == 0:
             continue
         push_accumulator(states, accumulators, cache_values, cache_boards, control, ply)
@@ -634,7 +808,7 @@ def negamax(
                 states, accumulators, cache_values, cache_boards,
                 moves, order, killers, history,
                 tt_key, tt_data, path, control,
-                ply + 1, depth - 1, np.int32(-beta), np.int32(-alpha), root_offset, 1,
+                ply + 1, new_depth, np.int32(-beta), np.int32(-alpha), root_offset, 1,
             )
         else:
             reduction = np.int64(0)
@@ -664,7 +838,7 @@ def negamax(
                 states, accumulators, cache_values, cache_boards,
                 moves, order, killers, history,
                 tt_key, tt_data, path, control,
-                ply + 1, depth - 1 - reduction, np.int32(-alpha - 1), np.int32(-alpha),
+                ply + 1, new_depth - reduction, np.int32(-alpha - 1), np.int32(-alpha),
                 root_offset, 1,
             )
             if score > alpha and reduction > 0:
@@ -672,14 +846,14 @@ def negamax(
                     states, accumulators, cache_values, cache_boards,
                 moves, order, killers, history,
                 tt_key, tt_data, path, control,
-                    ply + 1, depth - 1, np.int32(-alpha - 1), np.int32(-alpha), root_offset, 1,
+                    ply + 1, new_depth, np.int32(-alpha - 1), np.int32(-alpha), root_offset, 1,
                 )
             if score > alpha and score < beta:
                 score = -negamax(
                     states, accumulators, cache_values, cache_boards,
                 moves, order, killers, history,
                 tt_key, tt_data, path, control,
-                    ply + 1, depth - 1, np.int32(-beta), np.int32(-alpha), root_offset, 1,
+                    ply + 1, new_depth, np.int32(-beta), np.int32(-alpha), root_offset, 1,
                 )
 
         if control[STOP] != 0:
@@ -730,6 +904,46 @@ def negamax(
                                     history[loser, move_to(tried)] = (
                                         was - bonus - was * bonus // MAX_HISTORY
                                     )
+                    else:
+                        # The same gravity update for captures, in its own table. Rewarding the
+                        # winner alone would leave every other capture holding whatever score it
+                        # started with, so the table would learn which captures are good and
+                        # never which are pointless -- the failure that cost the quiet history
+                        # 81 Elo until it was fixed.
+                        bonus = 300 * depth - 250
+                        if bonus > MAX_HISTORY:
+                            bonus = MAX_HISTORY
+                        taken = (
+                            PAWN
+                            if move_flag(move) == EN_PASSANT
+                            else piece_on(states[ply], move_to(move), 1 - side)
+                        )
+                        if taken != 0:
+                            moving = piece_on(states[ply], move_from(move), side)
+                            at = caphist_index(
+                                side * 6 + moving - 1, np.int64(move_to(move)), np.int64(taken)
+                            )
+                            was = control[at]
+                            control[at] = was + bonus - was * bonus // MAX_HISTORY
+                            for earlier in range(index):
+                                tried = moves[ply, earlier]
+                                victim = (
+                                    PAWN
+                                    if move_flag(tried) == EN_PASSANT
+                                    else piece_on(states[ply], move_to(tried), 1 - side)
+                                )
+                                if victim == 0:
+                                    continue
+                                mover = piece_on(states[ply], move_from(tried), side)
+                                if mover == 0:
+                                    continue
+                                spot = caphist_index(
+                                    side * 6 + mover - 1,
+                                    np.int64(move_to(tried)),
+                                    np.int64(victim),
+                                )
+                                had = control[spot]
+                                control[spot] = had - bonus - had * bonus // MAX_HISTORY
                     break
 
     if played == 0:
@@ -740,7 +954,7 @@ def negamax(
         stored += np.int32(ply)
     elif stored < -MATE_THRESHOLD:
         stored -= np.int32(ply)
-    if tt_key[slot] != key or depth >= ((tt_data[slot] >> 38) & 0xFF):
+    if excluded == 0 and (tt_key[slot] != key or depth >= ((tt_data[slot] >> 38) & 0xFF)):
         if best_score >= beta:
             flag = LOWER
         elif best_score > original_alpha:

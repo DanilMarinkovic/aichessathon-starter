@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Copy files FROM Aire down the SAME connection aire/sh uses.
+#
+#   bash aire/pull versions/lc0big/weights/net.npz
+#   bash aire/pull --to /tmp/x aire/logs/anchor-cand-7816604.out
+#
+# The companion to aire/push, and it exists for the same reason: rsync opens its own ssh
+# connection and knows nothing about aire/sh's lock, so a "quick copy" is how a careful session
+# still produces a burst of dials. -e hands rsync the existing ControlPath so it rides the
+# master. Paths are remote-relative to the repository, and land at the same relative path here
+# unless --to says otherwise.
+set -euo pipefail
+HOST=${AIRE_HOST:-aire}
+REMOTE=${AIRE_REMOTE:-aichessathon-starter}
+cd "$(dirname "$0")/.."
+
+bash aire/sh true
+
+if [ -t 0 ] || [ -t 1 ]; then BATCH=no; else BATCH=yes; fi
+RSH="ssh -o BatchMode=$BATCH -o ControlMaster=no -o ControlPath=$HOME/.ssh/cm-%r@%h:%p"
+
+DEST=""
+if [ "${1:-}" = "--to" ]; then DEST="$2"; shift 2; mkdir -p "$DEST"; fi
+for path in "$@"; do
+  if [ -n "$DEST" ]; then
+    rsync -az -e "$RSH" "$HOST:$REMOTE/$path" "$DEST/"
+  else
+    mkdir -p "$(dirname "$path")"
+    rsync -az -e "$RSH" "$HOST:$REMOTE/$path" "$path"
+  fi
+done

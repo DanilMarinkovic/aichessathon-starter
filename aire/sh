@@ -30,7 +30,10 @@ LOCK=${TMPDIR:-/tmp}/aire-master.lock
 # BatchMode so a missing key fails immediately and visibly rather than sitting on a password
 # prompt. An interactive prompt from a non-interactive caller is what produced the auth failure
 # that most likely triggered the block.
-ssh_opts=(-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4)
+# BatchMode only when there is no terminal to prompt at. Run by hand you get the password
+# prompt; run by a script you get a clean, immediate failure instead of a hung connection.
+if [ -t 0 ] || [ -t 1 ]; then BATCH=no; else BATCH=yes; fi
+ssh_opts=(-o BatchMode=$BATCH -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4)
 
 exec 9>"$LOCK"
 flock 9
@@ -49,3 +52,6 @@ if [ "$#" -gt 0 ]; then
 else
   ssh "${ssh_opts[@]}" "$HOST" 'bash -s'
 fi
+
+# Companion: aire/push copies files down this same connection. Never call rsync directly --
+# it dials its own, and through a ProxyJump that is two connections per invocation.
